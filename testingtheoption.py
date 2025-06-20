@@ -31,8 +31,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 04:55 PM EDT, June 20, 2025 = 20:55 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 20:55:00", tz="UTC")
+# Current date and time: 05:01 PM EDT, June 20, 2025 = 21:01 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:01:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -146,11 +146,14 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     # Ensure expiry_datetime_col is timezone-aware (UTC)
-    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True)
+    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True, errors='coerce')
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.floor('D') + pd.Timedelta(hours=8)
     if dfc['expiry_datetime_col'].dt.tz is None:
         logging.warning("expiry_datetime_col is naive after creation. Localizing to UTC.")
         dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.tz_localize('UTC')
+    if dfc['expiry_datetime_col'].isna().any():
+        logging.warning("Some expiry_datetime_col values are NaT. Dropping these rows.")
+        dfc = dfc.dropna(subset=['expiry_datetime_col'])
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
 @st.cache_data(ttl=600)
@@ -209,13 +212,27 @@ def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
         return []
-    # Ensure all timestamps are UTC-aware
-    expiry_dates = [
-        pd.to_datetime(i.get("instrument_name", "").split("-")[1], format="%d%b%y", utc=True).replace(hour=8)
-        for i in instruments
-        if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']
-    ]
+    expiry_dates = []
+    for i in instruments:
+        instr_name = i.get("instrument_name", "")
+        parts = instr_name.split("-")
+        if len(parts) >= 3 and parts[-1] in ['C', 'P']:
+            try:
+                # Parse date and ensure UTC timezone
+                exp_date = pd.to_datetime(parts[1], format="%d%b%y", utc=True, errors='raise')
+                # Set time to 08:00 UTC in a timezone-safe way
+                exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0)
+                expiry_dates.append(exp_date)
+            except ValueError as e:
+                logging.warning(f"Invalid date format in instrument {instr_name}: {e}")
+                continue
+    if not expiry_dates:
+        logging.warning("No valid expiry dates found.")
+        return []
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
+    # Debug timezone info
+    logging.info(f"current_date_utc_ts: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
+    logging.info(f"expiry_dates tz: {[x.tz for x in expiry_dates]}")
     mask = [exp > current_date_utc_ts for exp in expiry_dates]
     return [exp for exp, m in zip(expiry_dates, mask) if m]
 
