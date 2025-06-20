@@ -10,7 +10,6 @@ from plotly.subplots import make_subplots
 from scipy.stats import norm
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import re
@@ -20,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Version marker
-CODE_VERSION = "2025-06-20-v11"
+CODE_VERSION = "2025-06-20-v12"
 logger.info(f"Running code version: {CODE_VERSION}")
 
 # --- Constants ---
@@ -268,10 +267,10 @@ def get_valid_expiration_options(current_date_utc):
     future_expiries = []
     for date_str in unique_date_strings:
         try:
-            exp_date = pd.to_datetime(date_str + " 08:00:00", format="%d%b%y %H:%M:%S", utc=True)
-            logger.debug(f"Processed expiry {date_str}: {exp_date}, tz: {exp_date.tzinfo}")
+            exp_date = pd.to_datetime(f"{date_str} 08:00:00+00:00", format="%d%b%y %H:%M:%S%z", utc=True)
             if exp_date > current_date_utc_ts:
                 future_expiries.append(exp_date)
+            logger.debug(f"Processed expiry {date_str}: {exp_date}, tz: {exp_date.tzinfo}")
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to process date '{date_str}': {e}")
             continue
@@ -491,32 +490,22 @@ def main():
 
         default_exp_idx = 0
         if len(valid_expiries) > 1:
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_expiry = {
-                    executor.submit(
-                        lambda x: (
-                            x,
-                            np.sum([
-                                fetch_ticker(instr).get('open_interest', 0)
-                                for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] +
-                                get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]
-                            ])
-                        ),
-                        exp
-                    ): exp for exp in valid_expiries
-                }
-                expiry_oi_map = {}
-                for future in as_completed(future_to_expiry):
-                    try:
-                        expiry, oi = future.result()
-                        expiry_oi_map[expiry] = oi
-                    except Exception as e:
-                        logger.warning(f"Error processing expiry: {e}")
-                if not expiry_oi_map:
-                    st.error("No valid open interest data for expiries.")
-                    st.stop()
-                best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-                default_exp_idx = valid_expiries.index(best_expiry_by_oi)
+            expiry_oi_map = {}
+            for exp in valid_expiries:
+                try:
+                    oi = sum(
+                        fetch_ticker(instr).get('open_interest', 0)
+                        for instr in get_option_instruments(all_instruments_list, "C", exp.strftime("%d%b%y").upper(), coin)[:50] +
+                        get_option_instruments(all_instruments_list, "P", exp.strftime("%d%b%y").upper(), coin)[:50]
+                    )
+                    expiry_oi_map[exp] = oi
+                except Exception as e:
+                    logger.warning(f"Error processing expiry {exp}: {e}")
+            if not expiry_oi_map:
+                st.error("No valid open interest data for expiries.")
+                st.stop()
+            best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
+            default_exp_idx = valid_expiries.index(best_expiry_by_oi)
 
         selected_expiry = st.sidebar.selectbox(
             "Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y")
