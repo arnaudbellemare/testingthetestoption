@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import Pool
 import gc
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,9 +29,11 @@ URL_TICKER = f"{BASE_URL}/{TICKER_ENDPOINT}"
 COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_price_close", "iv_open", "iv_high", "iv_low", "iv_close", "mark_volume"]
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
+RETRY_ATTEMPTS = 3  # Number of retry attempts for API calls
+RETRY_DELAY = 2     # Delay between retries in seconds
 
-# Current date and time: 03:45 PM EDT, June 20, 2025 = 19:45 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 45, tzinfo=dt.timezone.utc)
+# Current date and time: 03:54 PM EDT, June 20, 2025 = 19:54 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 54, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -96,12 +99,23 @@ def fetch_instruments():
         st.error(f"Error fetching instruments: {e}")
         return []
 
+@retry(stop=stop_after_attempt(RETRY_ATTEMPTS), wait=wait_fixed(RETRY_DELAY), retry=retry_if_exception_type(requests.exceptions.RequestException))
+@st.cache_data(ttl=600)
+def fetch_ticker(instr_name):
+    try:
+        r = requests.get(URL_TICKER, params={"instrument_name": instr_name}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("result", {})
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Error fetching ticker {instr_name}: {e}")
+        return {}
+
 @st.cache_data(ttl=600)
 def fetch_ticker_batch(instrument_names):
     ticker_data = {}
     try:
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_instr = {executor.submit(lambda x: requests.get(URL_TICKER, params={"instrument_name": x}, timeout=REQUEST_TIMEOUT).json().get("result", {}), instr): instr for instr in instrument_names}
+        with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced max_workers to 2 to limit concurrent requests
+            future_to_instr = {executor.submit(fetch_ticker, instr): instr for instr in instrument_names}
             for future in as_completed(future_to_instr):
                 instr = future_to_instr[future]
                 ticker_data[instr] = future.result()
@@ -110,16 +124,6 @@ def fetch_ticker_batch(instrument_names):
         for instr in instrument_names:
             ticker_data[instr] = fetch_ticker(instr)
     return ticker_data
-
-@st.cache_data(ttl=600)
-def fetch_ticker(instr_name):
-    try:
-        r = requests.get(URL_TICKER, params={"instrument_name": instr_name}, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json().get("result", {})
-    except Exception as e:
-        logging.warning(f"Error fetching ticker {instr_name}: {e}")
-        return {}
 
 @st.cache_data(ttl=600)
 def fetch_data(instruments_tuple, historical_lookback_days=7):
@@ -137,7 +141,6 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC')
-    # Use vectorized dt.replace to set hour to 8, preserving timezone
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.replace(hour=8, errors='coerce')
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
@@ -195,9 +198,7 @@ def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
         return []
-    # Use Pandas Timestamp to handle timezone-aware datetimes
     expiry_dates = [pd.Timestamp(dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8)) for i in instruments if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']]
-    # Convert current_date_utc to Timestamp for consistent comparison
     current_date_utc_ts = pd.Timestamp(current_date_utc)
     mask = [exp > current_date_utc_ts for exp in expiry_dates]
     return [exp for exp, m in zip(expiry_dates, mask) if m]
@@ -212,9 +213,7 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    # Ensure snapshot_time_utc is a Timestamp and handle NaT values
     snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc)
-    # Subtract and handle potential NaT values with fillna
     T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds().fillna(0) / (365 * 24 * 3600)
     T = np.where(T < 1e-9, 1e-9, T)
     sigma = df['iv_close'].values
@@ -497,7 +496,6 @@ def main():
 
     dft_with_hist_greeks = pd.DataFrame()
     if not dft.empty and not df_krak_5m.empty:
-        # Ensure date_time columns are already timezone-aware, no need for re-conversion
         merged_hist = pd.merge_asof(dft.sort_values('date_time'), df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}), on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)).dropna(subset=['spot_hist'])
         if not merged_hist.empty:
             with st.spinner("Calculating Greeks (Delta, Gamma, Vega, Theta) on historical data..."):
@@ -527,23 +525,28 @@ def main():
         if not dft_with_hist_greeks.empty and not df_krak_5m.empty and not np.isnan(spot_price):
             tc_bps_val_sidebar = st.sidebar.number_input("Transaction Cost (bps) for Sims", 0, 10, TRANSACTION_COST_BPS, 1, key="adv_tc_bps_val_sidebar_vFull2_final")
             use_dyn_thresh_sidebar = st.sidebar.checkbox("Use Dynamic Threshold for Sims", True, key="adv_dh_dyn_thr_val_sidebar_vFull2_final")
-            with Pool(processes=4) as pool:
-                hedge_instance_std = HedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, use_dynamic_threshold=use_dyn_thresh_sidebar, transaction_cost_bps=tc_bps_val_sidebar)
-                delta_df_std, hedge_actions_std = pool.starmap(hedge_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
-            if not delta_df_std.empty:
-                plot_delta_hedging_thalex(delta_df_std, hedge_actions_std, hedge_instance_std.base_threshold, use_dyn_thresh_sidebar, coin, spot_price, df_krak_5m)
-            with Pool(processes=4) as pool:
-                matrix_instance_std = MatrixHedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, transaction_cost_bps=tc_bps_val_sidebar)
-                state_df_mat_std, actions_df_mat_std = pool.starmap(matrix_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
-            if not state_df_mat_std.empty: plot_matrix_hedge_thalex(state_df_mat_std, actions_df_mat_std, coin)
-            if sel_call_pair and sel_put_pair:
-                plot_net_delta_otm_pair(dft_with_hist_greeks, df_krak_5m, exchange1, sel_call_pair, sel_put_pair, all_calls_expiry, all_puts_expiry)
+            try:
+                with Pool(processes=4) as pool:
+                    hedge_instance_std = HedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, use_dynamic_threshold=use_dyn_thresh_sidebar, transaction_cost_bps=tc_bps_val_sidebar)
+                    delta_df_std, hedge_actions_std = pool.starmap(hedge_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
+                if not delta_df_std.empty:
+                    plot_delta_hedging_thalex(delta_df_std, hedge_actions_std, hedge_instance_std.base_threshold, use_dyn_thresh_sidebar, coin, spot_price, df_krak_5m)
+                with Pool(processes=4) as pool:
+                    matrix_instance_std = MatrixHedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, transaction_cost_bps=tc_bps_val_sidebar)
+                    state_df_mat_std, actions_df_mat_std = pool.starmap(matrix_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
+                if not state_df_mat_std.empty:
+                    plot_matrix_hedge_thalex(state_df_mat_std, actions_df_mat_std, coin)
+                if sel_call_pair and sel_put_pair:
+                    plot_net_delta_otm_pair(dft_with_hist_greeks, df_krak_5m, exchange1, sel_call_pair, sel_put_pair, all_calls_expiry, all_puts_expiry)
+            except Exception as e:
+                st.warning(f"Error in Standard Delta Hedging Simulations: {e}")
+                logging.error(f"Error in Standard Delta Hedging Simulations: {e}", exc_info=True)
         else:
             st.warning("Standard Delta Hedging Sims: Data insufficient.")
 
     st.markdown("---"); st.header("Delta Hedging M2M Dashboard (Dark Theme)")
     if st.sidebar.checkbox("Show Delta Hedging M2M Dashboard (Dark Style)", True, key="adv_show_dh_m2m_dark_dashboard_main_vFull3_final"):
-        if not delta_df_std.empty and not np.isnan(spot_price):
+        if 'delta_df_std' in locals() and not delta_df_std.empty and not np.isnan(spot_price):
             plot_hedging_summary_dashboard_dark_style(delta_df_std, hedge_actions_std, hedge_instance_std.base_threshold, use_dyn_thresh_sidebar, coin, spot_price)
         else:
             st.info("Dark Dashboard: Data from 'Standard Delta Hedging Simulations' is not available.")
