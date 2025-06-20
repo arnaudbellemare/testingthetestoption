@@ -275,93 +275,104 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     return df.assign(delta=delta, gamma=gamma, vega=vega, theta=theta)
 
 @st.cache_data(ttl=600)
-def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_time_utc, risk_free_rate=0.0):
-    st.subheader("MM Indicative Delta-Gamma Hedge Adjustment")
-    if dft_latest_snap.empty or not all(c in dft_latest_snap for c in ['instrument_name', 'k', 'option_type', 'iv_close', 'open_interest', 'expiry_datetime_col']):
-        st.warning("No data for analysis.")
-        return
+def display_mm_gamma_adjustment_analysis(
+    dft_latest_snap, spot_price, snapshot_time_utc, risk_free_rate=0.0,
+    steth_position=0.0, inverse_position=0.0, short_put_position=0.0, funding_rate=0.0
+):
+    logger.info("Computing MM gamma adjustment analysis.")
+    # Validate inputs
+    if not isinstance(dft_latest_snap, pd.DataFrame):
+        logger.error("dft_latest_snap must be a pandas DataFrame.")
+        return None
+    required_cols = ['instrument_name', 'k', 'option_type', 'iv_close', 'open_interest', 'expiry_datetime_col']
+    if dft_latest_snap.empty or not all(c in dft_latest_snap for c in required_cols):
+        logger.warning(f"Invalid or empty DataFrame. Missing columns: {set(required_cols) - set(dft_latest_snap.columns)}")
+        return None
     if pd.isna(spot_price) or spot_price <= 0:
-        st.warning(f"Invalid spot price: {spot_price}.")
-        return
+        logger.warning(f"Invalid spot price: {spot_price}.")
+        return None
+    if not isinstance(snapshot_time_utc, pd.Timestamp):
+        logger.error(f"Invalid snapshot_time_utc: {snapshot_time_utc}. Must be a pandas Timestamp.")
+        return None
 
     df_book = dft_latest_snap.copy()
     df_book['open_interest'] = pd.to_numeric(df_book['open_interest'], errors='coerce').fillna(0)
     df_book = df_book[df_book['open_interest'] > 0]
     if df_book.empty:
-        st.info("No options with open interest.")
-        return
+        logger.info("No options with open interest.")
+        return None
 
     df_book = compute_greeks_vectorized(df_book, spot_price, snapshot_time_utc, risk_free_rate)
+    if df_book[['delta', 'gamma', 'vega', 'theta']].isna().all().any():
+        logger.warning("Greek calculations resulted in NaN values.")
+        return None
+
     mm_net_delta_initial = -df_book['delta'].mul(df_book['open_interest']).sum()
     mm_net_gamma_initial = -df_book['gamma'].mul(df_book['open_interest']).sum()
     mm_net_theta_initial = -df_book['theta'].mul(df_book['open_interest']).sum()
 
-    st.metric("MM Initial Net Delta", f"{mm_net_delta_initial:,.2f}")
-    st.metric("MM Initial Net Gamma", f"{mm_net_gamma_initial:,.4f}")
-    st.metric("MM Initial Net Theta", f"{mm_net_theta_initial:,.2f}")
+    result = {
+        'mm_net_delta_initial': mm_net_delta_initial,
+        'mm_net_gamma_initial': mm_net_gamma_initial,
+        'mm_net_theta_initial': mm_net_theta_initial,
+        'gamma_hedger': None,
+        'theta_hedger': None,
+        'metrics': {}
+    }
 
     calls_in_book = df_book[df_book['option_type'] == 'C']
-    gamma_hedger = None
     if not calls_in_book.empty:
         calls_in_book = calls_in_book.assign(moneyness_dist=np.abs(calls_in_book['k'] - spot_price))
-        gamma_hedger = calls_in_book.loc[calls_in_book['moneyness_dist'].idxmin()]
+        result['gamma_hedger'] = calls_in_book.loc[calls_in_book['moneyness_dist'].idxmin()]
 
     puts_in_book = df_book[df_book['option_type'] == 'P']
-    theta_hedger = None
     if not puts_in_book.empty:
         puts_in_book = puts_in_book.assign(moneyness_dist=np.abs(puts_in_book['k'] - spot_price))
-        theta_hedger = puts_in_book.loc[puts_in_book['moneyness_dist'].idxmin()]
+        result['theta_hedger'] = puts_in_book.loc[puts_in_book['moneyness_dist'].idxmin()]
 
-    if gamma_hedger is None and theta_hedger is None:
-        st.warning("No suitable hedging instruments.")
-        return
+    if result['gamma_hedger'] is None and result['theta_hedger'] is None:
+        logger.warning("No suitable hedging instruments.")
+        return result
 
-    st.info(f"Gamma Hedger: {gamma_hedger['instrument_name'] if gamma_hedger is not None else 'N/A'}")
-    st.info(f"Theta Hedger: {theta_hedger['instrument_name'] if theta_hedger is not None else 'N/A'}")
-
-    steth_position = st.sidebar.number_input("stETH Position Size", value=0.0, step=0.1)
-    inverse_position = st.sidebar.number_input("Inverse Position Size", value=0.0, step=0.1)
-    short_put_position = st.sidebar.number_input("Short Put Position Size", value=0.0, step=0.1)
-    funding_rate = fetch_funding_rates(exchange1, f"{st.session_state.selected_coin}/USDT").iloc[-1]['funding_rate'] if not fetch_funding_rates(exchange1, f"{st.session_state.selected_coin}/USDT").empty else 0.0
     inverse_delta = -1.0 * (1 + funding_rate)
     steth_delta = 1.0
-    put_delta = theta_hedger['delta'] if theta_hedger is not None else 0.0
-    put_theta = theta_hedger['theta'] if theta_hedger is not None else 0.0
+    put_delta = result['theta_hedger']['delta'] if result['theta_hedger'] is not None else 0.0
+    put_theta = result['theta_hedger']['theta'] if result['theta_hedger'] is not None else 0.0
 
     total_delta_extras = steth_position * steth_delta + inverse_position * inverse_delta + short_put_position * put_delta
     total_theta_extras = short_put_position * put_theta
 
-    N_h = -mm_net_gamma_initial / gamma_hedger['gamma'] if gamma_hedger is not None and abs(gamma_hedger['gamma']) > 1e-7 else 0.0
-    delta_from_gamma_hedge = N_h * gamma_hedger['delta'] if gamma_hedger is not None else 0.0
-    N_p = -mm_net_theta_initial / put_theta if theta_hedger is not None and abs(put_theta) > 1e-7 else 0.0
-    delta_from_theta_hedge = N_p * put_delta if theta_hedger is not None else 0.0
-    theta_from_theta_hedge = N_p * put_theta if theta_hedger is not None else 0.0
+    gamma_hedger_gamma = result['gamma_hedger']['gamma'] if result['gamma_hedger'] is not None else 0.0
+    N_h = -mm_net_gamma_initial / gamma_hedger_gamma if abs(gamma_hedger_gamma) > 1e-7 else 0.0
+    delta_from_gamma_hedge = N_h * result['gamma_hedger']['delta'] if result['gamma_hedger'] is not None else 0.0
+    N_p = -mm_net_theta_initial / put_theta if abs(put_theta) > 1e-7 else 0.0
+    delta_from_theta_hedge = N_p * put_delta if result['theta_hedger'] is not None else 0.0
+    theta_from_theta_hedge = N_p * put_theta if result['theta_hedger'] is not None else 0.0
 
     mm_net_delta_post_hedge = mm_net_delta_initial + delta_from_gamma_hedge + delta_from_theta_hedge + total_delta_extras
     mm_net_theta_post_hedge = mm_net_theta_initial + theta_from_theta_hedge + total_theta_extras
     underlying_hedge_qty = -mm_net_delta_post_hedge
-
-    st.markdown("#### Hedge Adjustments")
-    cols = st.columns(4)
-    cols[0].metric("Gamma Hedger Delta", f"{gamma_hedger['delta']:.4f}" if gamma_hedger is not None else "N/A")
-    cols[1].metric("Gamma Hedger Gamma", f"{gamma_hedger['gamma']:.6f}" if gamma_hedger is not None else "N/A")
-    cols[2].metric(f"Gamma Hedge Qty ({'Buy' if N_h > 0 else 'Sell'})", f"{abs(N_h):,.2f}" if gamma_hedger is not None else "N/A")
-    cols[3].metric("Put Delta", f"{put_delta:.4f}" if theta_hedger is not None else "N/A")
-
-    st.metric("Delta from Gamma Hedge", f"{delta_from_gamma_hedge:,.2f}")
-    st.metric("Delta from Theta Hedge", f"{delta_from_theta_hedge:,.2f}")
-    st.metric("Delta from Extras", f"{total_delta_extras:,.2f}")
-    st.metric("Theta from Theta Hedge", f"{theta_from_theta_hedge:,.2f}")
-    st.metric("Theta from Short Puts", f"{total_theta_extras:,.2f}")
-
-    st.markdown("#### Final Hedge")
-    st.metric("MM Net Delta (Post-Hedge)", f"{mm_net_delta_post_hedge:,.2f}")
-    st.metric("MM Net Theta (Post-Hedge)", f"{mm_net_theta_post_hedge:,.2f}")
-    action = "Buy" if underlying_hedge_qty > 0 else "Sell" if underlying_hedge_qty < 0 else "Hold"
-    st.metric(f"Underlying Hedge ({action})", f"{abs(underlying_hedge_qty):,.2f} {st.session_state.selected_coin}")
-
     final_net_delta = mm_net_delta_post_hedge + underlying_hedge_qty
-    st.success(f"**Resulting Net Delta:** {final_net_delta:,.4f}")
+
+    result['metrics'] = {
+        'gamma_hedger_delta': result['gamma_hedger']['delta'] if result['gamma_hedger'] is not None else np.nan,
+        'gamma_hedger_gamma': gamma_hedger_gamma,
+        'gamma_hedge_qty': abs(N_h),
+        'gamma_hedge_action': 'Buy' if N_h > 0 else 'Sell',
+        'put_delta': put_delta,
+        'delta_from_gamma_hedge': delta_from_gamma_hedge,
+        'delta_from_theta_hedge': delta_from_theta_hedge,
+        'total_delta_extras': total_delta_extras,
+        'theta_from_theta_hedge': theta_from_theta_hedge,
+        'total_theta_extras': total_theta_extras,
+        'mm_net_delta_post_hedge': mm_net_delta_post_hedge,
+        'mm_net_theta_post_hedge': mm_net_theta_post_hedge,
+        'underlying_hedge_qty': abs(underlying_hedge_qty),
+        'underlying_hedge_action': 'Buy' if underlying_hedge_qty > 0 else 'Sell' if underlying_hedge_qty < 0 else 'Hold',
+        'final_net_delta': final_net_delta
+    }
+    logger.info("MM gamma adjustment analysis completed successfully.")
+    return result
 
 @st.cache_data(ttl=300)
 def plot_delta_balance(ticker_list, spot_price):
@@ -532,43 +543,52 @@ def main():
         funding_rate_df = fetch_funding_rates(f"{coin}/USDT", days=7)
         funding_rate = funding_rate_df.iloc[-1]['funding_rate'] if not funding_rate_df.empty else 0.0
 
-        with st.spinner("Computing hedging analysis..."):
-            analysis_result = display_mm_gamma_adjustment_analysis(
-                dft_latest, spot_price, CURRENT_TIME_UTC, risk_free_rate,
-                steth_position, inverse_position, short_put_position, funding_rate
-            )
-
-        st.subheader("MM Delta-Gamma Hedge Adjustment")
-        if analysis_result:
-            st.metric("MM Initial Net Delta", f"{analysis_result['mm_net_delta_initial']:,.2f}")
-            st.metric("MM Initial Net Gamma", f"{analysis_result['mm_net_gamma_initial']:,.4f}")
-            st.metric("MM Initial Net Theta", f"{analysis_result['mm_net_theta_initial']:,.2f}")
-
-            if analysis_result['gamma_hedger'] is not None:
-                st.info(f"Gamma Hedger: {analysis_result['gamma_hedger']['instrument_name']}")
-            if analysis_result['theta_hedger'] is not None:
-                st.info(f"Theta Hedger: {analysis_result['theta_hedger']['instrument_name']}")
-
-            st.markdown("#### Hedge Adjustments")
-            cols = st.columns(4)
-            cols[0].metric("Gamma Hedger Delta", f"{analysis_result['metrics']['gamma_hedger_delta']:.4f}")
-            cols[1].metric("Gamma Hedger Gamma", f"{analysis_result['metrics']['gamma_hedger_gamma']:.6f}")
-            cols[2].metric(f"Gamma Hedge Qty ({analysis_result['metrics']['gamma_hedge_action']})", f"{analysis_result['metrics']['gamma_hedge_qty']:,.2f}")
-            cols[3].metric("Put Delta", f"{analysis_result['metrics']['put_delta']:.4f}")
-
-            st.metric("Delta from Gamma Hedge", f"{analysis_result['metrics']['delta_from_gamma_hedge']:,.2f}")
-            st.metric("Delta from Theta Hedge", f"{analysis_result['metrics']['delta_from_theta_hedge']:,.2f}")
-            st.metric("Delta from Extras", f"{analysis_result['metrics']['total_delta_extras']:,.2f}")
-            st.metric("Theta from Theta Hedge", f"{analysis_result['metrics']['theta_from_theta_hedge']:,.2f}")
-            st.metric("Theta from Short Puts", f"{analysis_result['metrics']['total_theta_extras']:,.2f}")
-
-            st.markdown("#### Final Hedge")
-            st.metric("MM Net Delta (Post-Hedge)", f"{analysis_result['metrics']['mm_net_delta_post_hedge']:,.2f}")
-            st.metric("MM Net Theta (Post-Hedge)", f"{analysis_result['metrics']['mm_net_theta_post_hedge']:,.2f}")
-            st.metric(f"Underlying Hedge ({analysis_result['metrics']['underlying_hedge_action']})", f"{analysis_result['metrics']['underlying_hedge_qty']:,.2f} {coin}")
-            st.success(f"**Resulting Net Delta:** {analysis_result['metrics']['final_net_delta']:,.4f}")
+        # Validate inputs before analysis
+        if dft_latest.empty or pd.isna(spot_price):
+            st.warning("Cannot perform hedging analysis: Missing latest data or valid spot price.")
         else:
-            st.warning("No valid hedging analysis results.")
+            with st.spinner("Computing hedging analysis..."):
+                try:
+                    analysis_result = display_mm_gamma_adjustment_analysis(
+                        dft_latest, spot_price, CURRENT_TIME_UTC, risk_free_rate,
+                        steth_position, inverse_position, short_put_position, funding_rate
+                    )
+                except Exception as e:
+                    logger.error(f"Hedging analysis failed: {e}")
+                    analysis_result = None
+                    st.error(f"Hedging analysis failed: {str(e)}")
+
+            st.subheader("MM Delta-Gamma Hedge Adjustment")
+            if analysis_result:
+                st.metric("MM Initial Net Delta", f"{analysis_result['mm_net_delta_initial']:,.2f}")
+                st.metric("MM Initial Net Gamma", f"{analysis_result['mm_net_gamma_initial']:,.4f}")
+                st.metric("MM Initial Net Theta", f"{analysis_result['mm_net_theta_initial']:,.2f}")
+
+                if analysis_result['gamma_hedger'] is not None:
+                    st.info(f"Gamma Hedger: {analysis_result['gamma_hedger']['instrument_name']}")
+                if analysis_result['theta_hedger'] is not None:
+                    st.info(f"Theta Hedger: {analysis_result['theta_hedger']['instrument_name']}")
+
+                st.markdown("#### Hedge Adjustments")
+                cols = st.columns(4)
+                cols[0].metric("Gamma Hedger Delta", f"{analysis_result['metrics']['gamma_hedger_delta']:.4f}")
+                cols[1].metric("Gamma Hedger Gamma", f"{analysis_result['metrics']['gamma_hedger_gamma']:.6f}")
+                cols[2].metric(f"Gamma Hedge Qty ({analysis_result['metrics']['gamma_hedge_action']})", f"{analysis_result['metrics']['gamma_hedge_qty']:,.2f}")
+                cols[3].metric("Put Delta", f"{analysis_result['metrics']['put_delta']:.4f}")
+
+                st.metric("Delta from Gamma Hedge", f"{analysis_result['metrics']['delta_from_gamma_hedge']:,.2f}")
+                st.metric("Delta from Theta Hedge", f"{analysis_result['metrics']['delta_from_theta_hedge']:,.2f}")
+                st.metric("Delta from Extras", f"{analysis_result['metrics']['total_delta_extras']:,.2f}")
+                st.metric("Theta from Theta Hedge", f"{analysis_result['metrics']['theta_from_theta_hedge']:,.2f}")
+                st.metric("Theta from Short Puts", f"{analysis_result['metrics']['total_theta_extras']:,.2f}")
+
+                st.markdown("#### Final Hedge")
+                st.metric("MM Net Delta (Post-Hedge)", f"{analysis_result['metrics']['mm_net_delta_post_hedge']:,.2f}")
+                st.metric("MM Net Theta (Post-Hedge)", f"{analysis_result['metrics']['mm_net_theta_post_hedge']:,.2f}")
+                st.metric(f"Underlying Hedge ({analysis_result['metrics']['underlying_hedge_action']})", f"{analysis_result['metrics']['underlying_hedge_qty']:,.2f} {coin}")
+                st.success(f"**Resulting Net Delta:** {analysis_result['metrics']['final_net_delta']:,.4f}")
+            else:
+                st.warning("No valid hedging analysis results. Check data or inputs.")
 
     st.markdown("---")
     st.header("Debug Tables")
@@ -581,6 +601,5 @@ def main():
 
     gc.collect()
     logger.info(f"Dashboard rendering complete for {coin} {e_str}")
-
 if __name__ == "__main__":
     main()
