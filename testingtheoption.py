@@ -31,8 +31,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 05:01 PM EDT, June 20, 2025 = 21:01 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:01:00", tz="UTC")
+# Current date and time: 05:14 PM EDT, June 20, 2025 = 21:14 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:14:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -45,7 +45,6 @@ except Exception as e:
 
 # --- Utility Functions ---
 
-# Login Functions
 @st.cache_data(ttl=3600)
 def load_credentials():
     try:
@@ -93,15 +92,17 @@ def safe_get_in(keys, data_dict, default=None):
             return default
     return current
 
-# Fetch and Filter Functions
 @st.cache_data(ttl=600)
 def fetch_instruments():
     try:
         resp = requests.get(URL_INSTRUMENTS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        return resp.json().get("result", [])
+        instruments = resp.json().get("result", [])
+        logging.info(f"Sample instruments: {[i.get('instrument_name', '') for i in instruments[:10]]}")
+        return instruments
     except Exception as e:
         st.error(f"Error fetching instruments: {e}")
+        logging.error(f"Error fetching instruments: {e}", exc_info=True)
         return []
 
 @retry(stop=stop_after_attempt(RETRY_ATTEMPTS), wait=wait_fixed(RETRY_DELAY), retry=retry_if_exception_type(requests.exceptions.RequestException))
@@ -145,14 +146,13 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True)
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
-    # Ensure expiry_datetime_col is timezone-aware (UTC)
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True, errors='coerce')
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.floor('D') + pd.Timedelta(hours=8)
     if dfc['expiry_datetime_col'].dt.tz is None:
-        logging.warning("expiry_datetime_col is naive after creation. Localizing to UTC.")
+        logging.warning("expiry_datetime_col is naive. Localizing to UTC.")
         dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.tz_localize('UTC')
     if dfc['expiry_datetime_col'].isna().any():
-        logging.warning("Some expiry_datetime_col values are NaT. Dropping these rows.")
+        logging.warning(f"NaT values in expiry_datetime_col: {dfc['expiry_datetime_col'].isna().sum()}. Dropping these rows.")
         dfc = dfc.dropna(subset=['expiry_datetime_col'])
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
@@ -211,30 +211,43 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
 def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
+        logging.warning("No instruments returned from fetch_instruments.")
         return []
     expiry_dates = []
+    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
     for i in instruments:
         instr_name = i.get("instrument_name", "")
         parts = instr_name.split("-")
-        if len(parts) >= 3 and parts[-1] in ['C', 'P']:
-            try:
-                # Parse date and ensure UTC timezone
-                exp_date = pd.to_datetime(parts[1], format="%d%b%y", utc=True, errors='raise')
-                # Set time to 08:00 UTC in a timezone-safe way
-                exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0)
-                expiry_dates.append(exp_date)
-            except ValueError as e:
-                logging.warning(f"Invalid date format in instrument {instr_name}: {e}")
-                continue
-    if not expiry_dates:
-        logging.warning("No valid expiry dates found.")
+        if len(parts) < 3 or parts[-1] not in ['C', 'P']:
+            logging.debug(f"Skipping invalid instrument format: {instr_name}")
+            continue
+        date_str = parts[1]
+        try:
+            # Parse date directly as UTC
+            exp_date = pd.to_datetime(date_str, format="%d%b%y", utc=True, errors='raise')
+            # Ensure time is set to 08:00 UTC
+            exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0, tzinfo=dt.timezone.utc)
+            if exp_date.tzinfo is None:
+                logging.error(f"Naive timestamp after replace for {instr_name}: {exp_date}")
+                exp_date = exp_date.tz_localize('UTC')
+            logging.debug(f"Parsed expiry for {instr_name}: {exp_date}, tz: {exp_date.tzinfo}")
+            expiry_dates.append(exp_date)
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Failed to parse date '{date_str}' in instrument {instr_name}: {e}")
+            continue
+    # Filter future expiries
+    future_expiries = [
+        exp for exp in expiry_dates
+        if exp.tzinfo == dt.timezone.utc and exp > current_date_utc_ts
+    ]
+    if not future_expiries:
+        logging.warning("No valid future expiry dates found.")
         return []
-    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
-    # Debug timezone info
+    # Remove duplicates and sort
+    unique_expiries = sorted(list(set(future_expiries)))
     logging.info(f"current_date_utc_ts: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
-    logging.info(f"expiry_dates tz: {[x.tz for x in expiry_dates]}")
-    mask = [exp > current_date_utc_ts for exp in expiry_dates]
-    return [exp for exp, m in zip(expiry_dates, mask) if m]
+    logging.info(f"Valid expiries: {unique_expiries[:5]}, tz: {[x.tz for x in unique_expiries]}")
+    return unique_expiries
 
 @st.cache_data(ttl=600)
 def get_option_instruments(instruments, option_type, expiry_str, coin):
@@ -247,18 +260,15 @@ def get_option_instruments(instruments, option_type, expiry_str, coin):
 @st.cache_data(ttl=600)
 def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=0.0):
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
+        logging.warning("Invalid input for compute_greeks_vectorized: empty or missing columns.")
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    # Ensure snapshot_time_utc is a timezone-aware pd.Timestamp
     snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc, tz='UTC')
-    
-    # Ensure expiry_datetime_col is timezone-aware (UTC)
     df['expiry_datetime_col'] = pd.to_datetime(df['expiry_datetime_col'], utc=True, errors='coerce')
     if df['expiry_datetime_col'].isna().any():
-        logging.warning("Some expiry_datetime_col values are NaT. Filling with snapshot_time_utc.")
+        logging.warning(f"NaT values in expiry_datetime_col: {df['expiry_datetime_col'].isna().sum()}. Filling with snapshot_time_utc.")
         df['expiry_datetime_col'] = df['expiry_datetime_col'].fillna(snapshot_time_utc_ts)
     
-    # Calculate time to expiry (T) in years
     T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds().fillna(0) / (365 * 24 * 3600)
     T = np.where(T < 1e-9, 1e-9, T)
     
@@ -384,7 +394,7 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
     st.success(f"**Resulting Book Net Delta (Post-All Adjustments):** {final_net_delta_book:,.4f} (should be ~0)")
     st.caption("This indicates the spot/perp hedge needed for the MM to become delta-neutral.")
 
-# --- Plotting Functions (Simplified) ---
+# --- Plotting Functions ---
 @st.cache_data(ttl=300)
 def plot_delta_balance(ticker_list, spot_price):
     if not ticker_list or pd.isna(spot_price):
@@ -415,7 +425,6 @@ def plot_open_interest_delta(ticker_list, spot_price):
     fig.add_hline(y=-0.5, line_dash="dot", line_color="grey")
     st.plotly_chart(fig, use_container_width=True)
 
-# Placeholder for undefined plotting functions
 def plot_intraday_premium_spikes(df_options_hist, df_spot_hist, coin_symbol, spot_price_latest, selected_expiry_str):
     st.subheader(f"Intraday Premium Spikes ({coin_symbol} - {selected_expiry_str})")
     st.info("Premium Spikes plot not implemented due to missing function definition.")
@@ -430,7 +439,6 @@ def main():
     st.set_page_config(layout="wide", page_title="Advanced Options Hedging & MM Dashboard")
     login()
 
-    # Initialize session state
     if 'selected_coin' not in st.session_state:
         st.session_state.selected_coin = "BTC"
     elif not isinstance(st.session_state.selected_coin, str):
@@ -493,8 +501,16 @@ def main():
                     exp
                 ): exp for exp in valid_expiries
             }
-            expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
-        if expiry_oi_map:
+            expiry_oi_map = {}
+            for future in as_completed(future_to_expiry):
+                try:
+                    expiry, oi = future.result()
+                    expiry_oi_map[expiry] = oi
+                except Exception as e:
+                    logging.warning(f"Error processing expiry in future: {e}")
+            if not expiry_oi_map:
+                st.error("No valid open interest data for expiries.")
+                st.stop()
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
             default_exp_idx = valid_expiries.index(best_expiry_by_oi)
 
