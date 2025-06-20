@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:35 PM EDT, June 20, 2025 = 19:35 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 35, tzinfo=dt.timezone.utc)
+# Current date and time: 03:34 PM EDT, June 20, 2025 = 19:34 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 34, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -133,10 +133,12 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     if not dfs:
         return pd.DataFrame()
     dfc = pd.concat(dfs, ignore_index=True)
-    dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True)  # Removed tz_localize since utc=True already sets UTC
+    dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True)
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
-    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC').dt.replace(hour=8)
+    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC')
+    # Apply replace to set hour to 8 using apply with a lambda function
+    dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].apply(lambda x: x.replace(hour=8) if pd.notna(x) else x)
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
 @st.cache_data(ttl=600)
