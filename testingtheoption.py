@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:34 PM EDT, June 20, 2025 = 19:34 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 34, tzinfo=dt.timezone.utc)
+# Current date and time: 03:38 PM EDT, June 20, 2025 = 19:38 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 38, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -194,10 +194,13 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
 def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
-        return np.array([])
-    expiry_dates = np.array([dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8) for i in instruments if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']], dtype='datetime64[us]')
-    mask = expiry_dates > np.datetime64(current_date_utc)
-    return np.sort(expiry_dates[mask])
+        return []
+    # Use Pandas Timestamp to handle timezone-aware datetimes
+    expiry_dates = [pd.Timestamp(dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8)) for i in instruments if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']]
+    # Convert current_date_utc to Timestamp for consistent comparison
+    current_date_utc_ts = pd.Timestamp(current_date_utc)
+    mask = [exp > current_date_utc_ts for exp in expiry_dates]
+    return [exp for exp, m in zip(expiry_dates, mask) if m]
 
 @st.cache_data(ttl=600)
 def get_option_instruments(instruments, option_type, expiry_str, coin):
@@ -209,7 +212,9 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    T = (pd.to_datetime(df['expiry_datetime_col']) - snapshot_time_utc).dt.total_seconds() / (365 * 24 * 3600)
+    # Use existing expiry_datetime_col directly, convert snapshot_time_utc to Timestamp
+    snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc)
+    T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds() / (365 * 24 * 3600)
     T = np.where(T < 1e-9, 1e-9, T)
     sigma = df['iv_close'].values
     k = df['k'].values
@@ -459,19 +464,20 @@ def main():
 
     current_snapshot_time = st.session_state.snapshot_time
     valid_expiries = get_valid_expiration_options(current_snapshot_time)
-    if not valid_expiries.size: st.error(f"No valid expiries for {coin}."); st.stop()
+    if not valid_expiries:
+        st.error(f"No valid expiries for {coin}."); st.stop()
 
     default_exp_idx = 0
-    if valid_expiries.size:
+    if valid_expiries:
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_expiry = {executor.submit(lambda x: (x, np.sum([fetch_ticker(instr).get('open_interest', 0) for instr in get_option_instruments(all_instruments_list, "C", pd.Timestamp(x).strftime("%d%b%y").upper(), coin)[:50] + get_option_instruments(all_instruments_list, "P", pd.Timestamp(x).strftime("%d%b%y").upper(), coin)[:50]])), exp): exp for exp in valid_expiries}
+            future_to_expiry = {executor.submit(lambda x: (x, np.sum([fetch_ticker(instr).get('open_interest', 0) for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] + get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]])), exp): exp for exp in valid_expiries}
             expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
         if expiry_oi_map:
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-            default_exp_idx = int(np.where(valid_expiries == best_expiry_by_oi)[0][0])  # Convert to Python int
+            default_exp_idx = int(valid_expiries.index(best_expiry_by_oi))  # Use list.index() instead of np.where for consistency
 
-    selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: pd.Timestamp(d).strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
-    e_str = pd.Timestamp(selected_expiry).strftime("%d%b%y").upper() if selected_expiry else "N/A"
+    selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
+    e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
     all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
     all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
     all_instr_selected_expiry = np.sort(np.concatenate([all_calls_expiry, all_puts_expiry]))
