@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:10 PM EDT, June 20, 2025 = 19:10 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 10, tzinfo=dt.timezone.utc)
+# Current date and time: 03:15 PM EDT, June 20, 2025 = 19:15 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 15, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -462,14 +462,14 @@ def main():
     default_exp_idx = 0
     if valid_expiries.size:
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_expiry = {executor.submit(lambda x: (x, np.sum([fetch_ticker(instr).get('open_interest', 0) for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] + get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]])), exp): exp for exp in valid_expiries}
+            future_to_expiry = {executor.submit(lambda x: (x, np.sum([fetch_ticker(instr).get('open_interest', 0) for instr in get_option_instruments(all_instruments_list, "C", pd.Timestamp(x).strftime("%d%b%y").upper(), coin)[:50] + get_option_instruments(all_instruments_list, "P", pd.Timestamp(x).strftime("%d%b%y").upper(), coin)[:50]])), exp): exp for exp in valid_expiries}
             expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
         if expiry_oi_map:
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
             default_exp_idx = np.where(valid_expiries == best_expiry_by_oi)[0][0]
 
-    selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
-    e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
+    selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: pd.Timestamp(d).strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
+    e_str = pd.Timestamp(selected_expiry).strftime("%d%b%y").upper() if selected_expiry else "N/A"
     all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
     all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
     all_instr_selected_expiry = np.sort(np.concatenate([all_calls_expiry, all_puts_expiry]))
