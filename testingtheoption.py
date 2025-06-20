@@ -32,8 +32,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 05:21 PM EDT, June 20, 2025 = 21:21 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:21:00", tz="UTC")
+# Current date and time: 05:28 PM EDT, June 20, 2025 = 21:28 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:28:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -216,7 +216,7 @@ def get_valid_expiration_options(current_date_utc):
         return []
     expiry_dates = []
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
-    # Regex to validate instrument_name format (e.g., BTC-27JUN25-50000-C)
+    # Regex to validate instrument_name (e.g., BTC-27JUN25-50000-C)
     instr_pattern = re.compile(r'^[A-Z]+-\d{2}[A-Z]{3}\d{2}-[0-9.]+-[CP]$')
     for i in instruments:
         instr_name = i.get("instrument_name", "")
@@ -226,14 +226,8 @@ def get_valid_expiration_options(current_date_utc):
         parts = instr_name.split("-")
         date_str = parts[1]
         try:
-            # Parse date as UTC and set time to 08:00
-            exp_date = pd.to_datetime(date_str, format="%d%b%y", utc=True, errors='raise')
-            exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0)
-            # Ensure UTC timezone
-            if exp_date.tzinfo is None:
-                exp_date = exp_date.tz_localize('UTC')
-            elif exp_date.tzinfo != dt.timezone.utc:
-                exp_date = exp_date.tz_convert('UTC')
+            # Parse date and time as UTC in one step
+            exp_date = pd.to_datetime(f"{date_str} 08:00:00", format="%d%b%y %H:%M:%S", utc=True, errors='raise')
             logging.debug(f"Parsed expiry for {instr_name}: {exp_date}, tz: {exp_date.tzinfo}")
             expiry_dates.append(exp_date)
         except (ValueError, TypeError) as e:
@@ -248,7 +242,10 @@ def get_valid_expiration_options(current_date_utc):
     future_expiries = []
     for exp in unique_expiries:
         try:
-            if exp.tzinfo != dt.timezone.utc:
+            if exp.tzinfo is None:
+                logging.error(f"Naive timestamp detected: {exp}. Localizing to UTC.")
+                exp = exp.tz_localize('UTC')
+            elif exp.tzinfo != dt.timezone.utc:
                 exp = exp.tz_convert('UTC')
             if exp > current_date_utc_ts:
                 future_expiries.append(exp)
@@ -259,6 +256,12 @@ def get_valid_expiration_options(current_date_utc):
             continue
     logging.info(f"current_date_utc_ts: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
     logging.info(f"Future expiries: {future_expiries[:5]}, tz: {[x.tz for x in future_expiries]}")
+    # Fallback: return a default expiry if none are valid
+    if not future_expiries:
+        logging.warning("No future expiries found. Returning default expiry.")
+        default_expiry = current_date_utc_ts + pd.Timedelta(days=7)
+        default_expiry = default_expiry.replace(hour=8, minute=0, second=0, microsecond=0)
+        return [default_expiry]
     return future_expiries
 
 @st.cache_data(ttl=600)
@@ -494,11 +497,11 @@ def main():
     current_snapshot_time = st.session_state.snapshot_time
     valid_expiries = get_valid_expiration_options(current_snapshot_time)
     if not valid_expiries:
-        st.error(f"No valid expiries for {coin}.")
-        st.stop()
+        st.error(f"No valid expiries for {coin}. Using default expiry.")
+        valid_expiries = [current_snapshot_time + pd.Timedelta(days=7)]
 
     default_exp_idx = 0
-    if valid_expiries:
+    if len(valid_expiries) > 1:
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_expiry = {
                 executor.submit(
@@ -607,12 +610,12 @@ def main():
     with st.expander("dft_raw (Initial Fetch - Head)"):
         st.dataframe(dft_raw.head(20))
     with st.expander("dft (After Current Ticker Filter - Head)"):
-        st.dataframe(dft.head(10))
+        st.dataframe(dft.head(20))
     with st.expander("dft_with_hist_greeks (For Sims - Head)"):
-        st.dataframe(dft_with_hist_greeks.head(10))
+        st.dataframe(dft_with_hist_greeks.head(20))
 
-    logging.info(f"--- ADVANCED Dashboard rendering completed for {coin} {e_str} ---")
     gc.collect()
+    logging.info(f"--- ADVANCED Dashboard rendering complete for {coin} {e_str} ---")
 
 if __name__ == "__main__":
     main()
