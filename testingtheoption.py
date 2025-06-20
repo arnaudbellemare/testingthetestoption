@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 02:57 PM EDT, June 20, 2025 = 18:57 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 18, 57, tzinfo=dt.timezone.utc)
+# Current date and time: 03:02 PM EDT, June 20, 2025 = 19:02 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 2, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -429,8 +429,8 @@ def main():
     if st.sidebar.button("Logout"): st.session_state.logged_in = False; st.rerun()
 
     st.sidebar.header("Configuration")
-    coin_options = np.array(["BTC", "ETH"])
-    current_coin_idx = np.where(coin_options == st.session_state.selected_coin)[0][0] if st.session_state.selected_coin in coin_options else 0
+    coin_options = ["BTC", "ETH"]  # Changed to list to avoid NumPy type issue
+    current_coin_idx = coin_options.index(st.session_state.selected_coin) if st.session_state.selected_coin in coin_options else 0
     selected_coin_widget = st.sidebar.selectbox("Cryptocurrency", coin_options, index=current_coin_idx, key="main_coin_select_adv_vFull2_final")
     if selected_coin_widget != st.session_state.selected_coin:
         st.session_state.selected_coin = selected_coin_widget
@@ -443,7 +443,7 @@ def main():
 
     pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7, key="pair_sim_lookback_days_adv_vFull2_final")
     spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1, key="spot_merge_tolerance_adv_vFull2_final")
-    df_krak_5m = fetch_kraken_data(coin=coin, days=np.max([10, pair_sim_lookback_days + 2]))
+    df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))
     df_spot_hist = df_krak_5m
     spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
 
