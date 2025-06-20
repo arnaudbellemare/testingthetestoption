@@ -205,13 +205,22 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
 def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
+        logger.warning("No instruments available for expiration options.")
         return []
     expiry_dates = [
-        pd.to_datetime(i.get("instrument_name", "").split("-")[1], format="%d%b%y", utc=True).replace(hour=8)
+        pd.to_datetime(
+            i.get("instrument_name", "").split("-")[1], format="%d%b%y", utc=True, errors='coerce'
+        ).replace(hour=8)
         for i in instruments
         if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").endswith(('C', 'P'))
     ]
-    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
+    # Filter out invalid (NaT) expiry dates
+    expiry_dates = [exp for exp in expiry_dates if pd.notna(exp)]
+    # Ensure current_date_utc is a timezone-aware Timestamp
+    current_date_utc_ts = pd.Timestamp(current_date_utc)
+    if current_date_utc_ts.tz is None:
+        logger.warning("current_date_utc is naive. Localizing to UTC.")
+        current_date_utc_ts = current_date_utc_ts.tz_localize('UTC')
     return [exp for exp in expiry_dates if exp > current_date_utc_ts]
 
 @st.cache_data(ttl=600)
