@@ -233,9 +233,20 @@ def get_option_instruments(instruments, option_type, expiry_str, coin):
 @st.cache_data(ttl=600)
 def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=0.0):
     if df.empty or not all(col in df for col in ['k', 'iv_close', 'option_type', 'expiry_datetime_col']):
+        logger.warning("Invalid input DataFrame for Greek calculations.")
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc, tz='UTC')
+    # Validate and convert snapshot_time_utc to a single UTC-aware Timestamp
+    try:
+        snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc)
+        if snapshot_time_utc_ts.tz is None:
+            logger.warning("snapshot_time_utc is naive. Localizing to UTC.")
+            snapshot_time_utc_ts = snapshot_time_utc_ts.tz_localize('UTC')
+    except (TypeError, ValueError) as e:
+        logger.error(f"Invalid snapshot_time_utc: {e}. Using CURRENT_TIME_UTC.")
+        snapshot_time_utc_ts = CURRENT_TIME_UTC
+    
+    df = df.copy()  # Avoid modifying input DataFrame
     df['expiry_datetime_col'] = pd.to_datetime(df['expiry_datetime_col'], utc=True, errors='coerce')
     df['expiry_datetime_col'] = df['expiry_datetime_col'].fillna(snapshot_time_utc_ts)
     
@@ -480,7 +491,7 @@ def main():
             ).dropna(subset=['spot_hist'])
             if not merged_hist.empty:
                 dft_with_hist_greeks = compute_greeks_vectorized(
-                    merged_hist, merged_hist['spot_hist'].values, merged_hist['date_time'].values, risk_free_rate
+                    merged_hist, merged_hist['spot_hist'].values, CURRENT_TIME_UTC, risk_free_rate
                 )
 
     dft_latest = pd.DataFrame()
