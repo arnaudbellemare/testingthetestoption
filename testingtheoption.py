@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Version marker
-CODE_VERSION = "2025-06-20-v1"
+CODE_VERSION = "2025-06-20-v11"
 logger.info(f"Running code version: {CODE_VERSION}")
 
 # --- Constants ---
@@ -236,8 +236,7 @@ def get_valid_expiration_options(current_date_utc):
     if not instruments:
         logger.warning("No instruments returned. Using default expiry.")
         default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
-        default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
-        return [default_expiry]
+        return [pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')]
     
     # Regex to validate instrument_name (e.g., BTC-27JUN25-50000-C)
     instr_pattern = re.compile(r'^[A-Z]+-\d{2}[A-Z]{3}\d{2}-[0-9.]+-[CP]$')
@@ -257,26 +256,22 @@ def get_valid_expiration_options(current_date_utc):
             logger.warning(f"Failed to validate date '{date_str}' in instrument {instr_name}: {e}")
             continue
     
-    # Deduplicate date strings
+    # Deduplicate and sort date strings
     unique_date_strings = sorted(list(set(expiry_date_strings)))
     if not unique_date_strings:
         logger.warning("No valid expiry dates found. Using default expiry.")
         default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
-        default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
-        return [default_expiry]
+        return [pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')]
     
-    # Convert to UTC-aware timestamps
+    # Convert to UTC-aware timestamps and filter
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
     future_expiries = []
     for date_str in unique_date_strings:
         try:
-            exp_date = pd.to_datetime(f"{date_str} 08:00:00", format="%d%b%y %H:%M:%S", utc=True)
-            if exp_date.tzinfo is None:
-                logger.error(f"Naive timestamp detected for {date_str}: {exp_date}. Localizing to UTC.")
-                exp_date = exp_date.tz_localize('UTC')
+            exp_date = pd.to_datetime(date_str + " 08:00:00", format="%d%b%y %H:%M:%S", utc=True)
+            logger.debug(f"Processed expiry {date_str}: {exp_date}, tz: {exp_date.tzinfo}")
             if exp_date > current_date_utc_ts:
                 future_expiries.append(exp_date)
-            logger.debug(f"Processed expiry {exp_date}, tz: {exp_date.tzinfo}")
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to process date '{date_str}': {e}")
             continue
@@ -491,8 +486,7 @@ def main():
         valid_expiries = get_valid_expiration_options(current_snapshot_time)
         if not valid_expiries:
             st.error(f"No valid expiries for {coin}. Using default expiry.")
-            default_expiry = current_snapshot_time + pd.Timedelta(days=7)
-            default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
+            default_expiry = pd.Timestamp(current_snapshot_time.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC') + pd.Timedelta(days=7)
             valid_expiries = [default_expiry]
 
         default_exp_idx = 0
