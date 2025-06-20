@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:15 PM EDT, June 20, 2025 = 19:15 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 15, tzinfo=dt.timezone.utc)
+# Current date and time: 03:20 PM EDT, June 20, 2025 = 19:20 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 20, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -466,7 +466,7 @@ def main():
             expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
         if expiry_oi_map:
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-            default_exp_idx = np.where(valid_expiries == best_expiry_by_oi)[0][0]
+            default_exp_idx = int(np.where(valid_expiries == best_expiry_by_oi)[0][0])  # Convert to Python int
 
     selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: pd.Timestamp(d).strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
     e_str = pd.Timestamp(selected_expiry).strftime("%d%b%y").upper() if selected_expiry else "N/A"
