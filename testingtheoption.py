@@ -32,8 +32,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 05:36 PM EDT, June 20, 2025 = 21:36 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:36:00", tz="UTC")
+# Current date and time: 05:44 PM EDT, June 20, 2025 = 21:44 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:44:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -149,11 +149,11 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True, errors='coerce')
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].apply(
-        lambda x: x.replace(hour=8, minute=0, second=0, microsecond=0) if pd.notnull(x) else x
+        lambda x: pd.Timestamp(
+            year=x.year, month=x.month, day=x.day,
+            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
+        ) if pd.notnull(x) else x
     )
-    if dfc['expiry_datetime_col'].dt.tz is None:
-        logging.warning("expiry_datetime_col is naive. Localizing to UTC.")
-        dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.tz_localize('UTC')
     if dfc['expiry_datetime_col'].isna().any():
         logging.warning(f"NaT values in expiry_datetime_col: {dfc['expiry_datetime_col'].isna().sum()}. Dropping these rows.")
         dfc = dfc.dropna(subset=['expiry_datetime_col'])
@@ -176,7 +176,7 @@ def fetch_single_instrument_data(name, days):
 @st.cache_data(ttl=600)
 def params_historical(instrument_name, days=7):
     now = CURRENT_TIME_UTC
-    start_dt = now - dt.timedelta(days=days)
+    start_dt = now - pd.Timedelta(days=days)
     return {"from": int(start_dt.timestamp()), "to": int(now.timestamp()), "resolution": "5m", "instrument_name": instrument_name}
 
 @st.cache_data(ttl=600)
@@ -184,7 +184,7 @@ def fetch_kraken_data(coin="BTC", days=7):
     try:
         k = ccxt.kraken()
         now = CURRENT_TIME_UTC
-        start = now - dt.timedelta(days=days)
+        start = now - pd.Timedelta(days=days)
         ohlcv = k.fetch_ohlcv(f"{coin}/USD", timeframe="5m", since=int(start.timestamp() * 1000))
         if ohlcv:
             return pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]).assign(
@@ -201,7 +201,7 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
         return pd.DataFrame()
     try:
         now = CURRENT_TIME_UTC
-        start = now - dt.timedelta(days=days)
+        start = now - pd.Timedelta(days=days)
         hist = exchange_instance.fetch_funding_rate_history(symbol=symbol, since=int(start.timestamp() * 1000))
         if hist:
             return pd.DataFrame([{'date_time': pd.to_datetime(e['timestamp'], unit='ms', utc=True), 'funding_rate': e['fundingRate'] * 365 * 3} for e in hist])
@@ -215,7 +215,12 @@ def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
         logging.warning("No instruments returned from fetch_instruments.")
-        return [pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)]
+        default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
+        default_expiry = pd.Timestamp(
+            year=default_expiry.year, month=default_expiry.month, day=default_expiry.day,
+            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
+        )
+        return [default_expiry]
     expiry_dates = []
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
     # Regex to validate instrument_name (e.g., BTC-27JUN25-50000-C)
@@ -228,9 +233,9 @@ def get_valid_expiration_options(current_date_utc):
         parts = instr_name.split("-")
         date_str = parts[1]
         try:
-            # Parse date as UTC without string concatenation
+            # Parse date as UTC
             exp_date = pd.to_datetime(date_str, format="%d%b%y", utc=True, errors='raise')
-            # Set time to 08:00 UTC in a timezone-safe way
+            # Set time to 08:00 UTC using pd.Timestamp
             exp_date = pd.Timestamp(
                 year=exp_date.year, month=exp_date.month, day=exp_date.day,
                 hour=8, minute=0, second=0, microsecond=0, tz='UTC'
@@ -253,13 +258,13 @@ def get_valid_expiration_options(current_date_utc):
     # Filter future expiries
     future_expiries = []
     for exp in unique_expiries:
+        if exp.tzinfo is None:
+            logging.error(f"Naive timestamp detected: {exp}. Localizing to UTC.")
+            exp = exp.tz_localize('UTC')
+        elif exp.tzinfo != dt.timezone.utc:
+            logging.warning(f"Non-UTC timezone for {exp}: {exp.tzinfo}. Converting to UTC.")
+            exp = exp.tz_convert('UTC')
         try:
-            if exp.tzinfo is None:
-                logging.error(f"Naive timestamp detected: {exp}. Localizing to UTC.")
-                exp = exp.tz_localize('UTC')
-            elif exp.tzinfo != dt.timezone.utc:
-                logging.warning(f"Non-UTC timezone for {exp}: {exp.tzinfo}. Converting to UTC.")
-                exp = exp.tz_convert('UTC')
             if exp > current_date_utc_ts:
                 future_expiries.append(exp)
             else:
@@ -508,10 +513,12 @@ def main():
     valid_expiries = get_valid_expiration_options(current_snapshot_time)
     if not valid_expiries:
         st.error(f"No valid expiries for {coin}. Using default expiry.")
-        valid_expiries = [pd.Timestamp(
-            year=current_snapshot_time.year, month=current_snapshot_time.month, day=current_snapshot_time.day,
+        default_expiry = current_snapshot_time + pd.Timedelta(days=7)
+        default_expiry = pd.Timestamp(
+            year=default_expiry.year, month=default_expiry.month, day=default_expiry.day,
             hour=8, minute=0, second=0, microsecond=0, tz='UTC'
-        ) + pd.Timedelta(days=7)]
+        )
+        valid_expiries = [default_expiry]
 
     default_exp_idx = 0
     if len(valid_expiries) > 1:
