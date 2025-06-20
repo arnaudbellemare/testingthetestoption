@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:02 PM EDT, June 20, 2025 = 19:02 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 2, tzinfo=dt.timezone.utc)
+# Current date and time: 03:10 PM EDT, June 20, 2025 = 19:10 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 10, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -421,7 +421,12 @@ def main():
     st.set_page_config(layout="wide", page_title="Advanced Options Hedging & MM Dashboard")
     login()
 
-    if 'selected_coin' not in st.session_state: st.session_state.selected_coin = "BTC"
+    # Ensure selected_coin is a string
+    if 'selected_coin' not in st.session_state:
+        st.session_state.selected_coin = "BTC"
+    elif not isinstance(st.session_state.selected_coin, str):
+        st.session_state.selected_coin = str(st.session_state.selected_coin)
+
     if 'snapshot_time' not in st.session_state: st.session_state.snapshot_time = CURRENT_TIME_UTC
     if 'risk_free_rate_input' not in st.session_state: st.session_state.risk_free_rate_input = 0.01
 
@@ -429,7 +434,7 @@ def main():
     if st.sidebar.button("Logout"): st.session_state.logged_in = False; st.rerun()
 
     st.sidebar.header("Configuration")
-    coin_options = ["BTC", "ETH"]  # Changed to list to avoid NumPy type issue
+    coin_options = ["BTC", "ETH"]  # List of strings
     current_coin_idx = coin_options.index(st.session_state.selected_coin) if st.session_state.selected_coin in coin_options else 0
     selected_coin_widget = st.sidebar.selectbox("Cryptocurrency", coin_options, index=current_coin_idx, key="main_coin_select_adv_vFull2_final")
     if selected_coin_widget != st.session_state.selected_coin:
