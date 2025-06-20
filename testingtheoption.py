@@ -29,6 +29,9 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
+# Current date and time: 02:35 PM EDT, June 20, 2025 = 18:35 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 18, 35, tzinfo=dt.timezone.utc)
+
 # Initialize exchange
 exchange1 = None
 try:
@@ -158,7 +161,7 @@ def fetch_single_instrument_data(name, days):
         return pd.DataFrame()
 
 def params_historical(instrument_name, days=7):
-    now = dt.datetime.now(dt.timezone.utc)
+    now = CURRENT_TIME_UTC
     start_dt = now - dt.timedelta(days=days)
     return {"from": int(start_dt.timestamp()), "to": int(now.timestamp()), "resolution": "5m", "instrument_name": instrument_name}
 
@@ -166,7 +169,7 @@ def params_historical(instrument_name, days=7):
 def fetch_kraken_data(coin="BTC", days=7):
     try:
         k = ccxt.kraken()
-        now = dt.datetime.now(dt.timezone.utc)
+        now = CURRENT_TIME_UTC
         start = now - dt.timedelta(days=days)
         ohlcv = k.fetch_ohlcv(f"{coin}/USD", timeframe="5m", since=int(start.timestamp() * 1000))
         if ohlcv:
@@ -183,7 +186,7 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
     if exchange_instance is None:
         return pd.DataFrame()
     try:
-        now = dt.datetime.now(dt.timezone.utc)
+        now = CURRENT_TIME_UTC
         start = now - dt.timedelta(days=days)
         hist = exchange_instance.fetch_funding_rate_history(symbol=symbol, since=int(start.timestamp() * 1000))
         if hist:
@@ -223,7 +226,7 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
 # --- Hedging Analysis ---
 def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_time_utc, risk_free_rate=0.0):
     st.subheader("MM Indicative Delta-Gamma Hedge Adjustment (Selected Expiry)")
-    st.caption("Assumes Market Maker is short the entire displayed option book for this expiry. Shows theoretical adjustment using a near-ATM call and stETH/inverse positions.")
+    st.caption("Assumes Market Maker is short the entire displayed option book for this expiry. Shows theoretical adjustment using a near-ATM call, short puts, stETH, and inverse positions.")
 
     if dft_latest_snap.empty or not all(c in dft_latest_snap.columns for c in ['instrument_name', 'k', 'option_type', 'iv_close', 'open_interest', 'expiry_datetime_col']):
         st.warning("Cannot perform analysis: Latest snapshot data missing required columns or empty.")
@@ -244,9 +247,11 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
     df_book = compute_greeks_vectorized(df_book, spot_price, snapshot_time_utc, risk_free_rate)
     mm_net_delta_initial = -(df_book['delta'] * df_book['open_interest']).sum()
     mm_net_gamma_initial = -(df_book['gamma'] * df_book['open_interest']).sum()
+    mm_net_theta_initial = -(df_book['theta'] * df_book['open_interest']).sum()  # Theta contribution from short positions
 
     st.metric("MM Initial Net Delta (Book)", f"{mm_net_delta_initial:,.2f}")
     st.metric("MM Initial Net Gamma (Book)", f"{mm_net_gamma_initial:,.4f}")
+    st.metric("MM Initial Net Theta (Book)", f"{mm_net_theta_initial:,.2f}")
 
     # Select gamma hedging instrument (near-ATM call)
     gamma_hedger_selected = None
@@ -256,49 +261,82 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
         atm_call = calls_in_book[calls_in_book['k'] >= spot_price].sort_values('moneyness_dist').iloc[0] if not calls_in_book[calls_in_book['k'] >= spot_price].empty else calls_in_book.sort_values('moneyness_dist').iloc[0]
         gamma_hedger_selected = atm_call
 
-    if gamma_hedger_selected is None:
-        st.warning("Could not select a suitable Call option from the book for gamma hedging.")
+    # Select short put for theta hedging
+    theta_hedger_selected = None
+    puts_in_book = df_book[df_book['option_type'] == 'P']
+    if not puts_in_book.empty:
+        puts_in_book['moneyness_dist'] = np.abs(puts_in_book['k'] - spot_price)
+        atm_put = puts_in_book[puts_in_book['k'] <= spot_price].sort_values('moneyness_dist').iloc[0]
+        theta_hedger_selected = atm_put
+
+    if gamma_hedger_selected is None and theta_hedger_selected is None:
+        st.warning("Could not select suitable Call or Put option from the book for hedging.")
         return
 
-    st.info(f"Selected Gamma Hedging Instrument: {gamma_hedger_selected['instrument_name']}")
+    st.info(f"Selected Gamma Hedging Instrument: {gamma_hedger_selected['instrument_name'] if gamma_hedger_selected else 'N/A'}")
+    st.info(f"Selected Theta Hedging Instrument: {theta_hedger_selected['instrument_name'] if theta_hedger_selected else 'N/A'}")
 
-    # Include stETH and inverse position contributions
+    # Include stETH, inverse positions, and short puts
     steth_delta = 1.0  # Assume stETH tracks ETH 1:1
     steth_position = st.sidebar.number_input("stETH Position Size", value=0.0, key="steth_pos")
     inverse_position = st.sidebar.number_input("Inverse Position Size", value=0.0, key="inverse_pos")
+    short_put_position = st.sidebar.number_input("Short Put Position Size", value=0.0, key="short_put_pos")
     funding_rate = fetch_funding_rates(exchange1, f"{st.session_state.selected_coin}/USDT").iloc[-1]['funding_rate'] if not fetch_funding_rates(exchange1, f"{st.session_state.selected_coin}/USDT").empty else 0.0
     inverse_delta = -1.0 * (1 + funding_rate)  # Simplified inverse delta with funding rate impact
+    put_delta = theta_hedger_selected['delta'] if theta_hedger_selected else 0.0
+    put_theta = theta_hedger_selected['theta'] if theta_hedger_selected else 0.0
 
-    total_delta_from_extras = (steth_position * steth_delta) + (inverse_position * inverse_delta)
+    total_delta_from_extras = (steth_position * steth_delta) + (inverse_position * inverse_delta) + (short_put_position * put_delta)
     total_gamma_from_extras = 0.0  # Assume stETH and inverse have negligible gamma
+    total_theta_from_extras = (short_put_position * put_theta)  # Theta from short puts
 
-    D_h = gamma_hedger_selected['delta']
-    G_h = gamma_hedger_selected['gamma']
-    if pd.isna(D_h) or pd.isna(G_h) or abs(G_h) < 1e-7:
-        st.error(f"Invalid greeks for gamma hedging instrument: Delta={D_h}, Gamma={G_h}")
-        return
+    if gamma_hedger_selected:
+        D_h = gamma_hedger_selected['delta']
+        G_h = gamma_hedger_selected['gamma']
+        if pd.isna(D_h) or pd.isna(G_h) or abs(G_h) < 1e-7:
+            st.error(f"Invalid greeks for gamma hedging instrument: Delta={D_h}, Gamma={G_h}")
+            return
+        N_h = -mm_net_gamma_initial / G_h
+        delta_from_gamma_hedge = N_h * D_h
+    else:
+        N_h = 0.0
+        delta_from_gamma_hedge = 0.0
 
-    N_h = -mm_net_gamma_initial / G_h
-    delta_from_gamma_hedge = N_h * D_h
-    mm_net_delta_post_gamma_hedge = mm_net_delta_initial + delta_from_gamma_hedge + total_delta_from_extras
+    if theta_hedger_selected:
+        N_p = -mm_net_theta_initial / put_theta if abs(put_theta) > 1e-7 else 0.0
+        delta_from_theta_hedge = N_p * put_delta
+        theta_from_theta_hedge = N_p * put_theta
+    else:
+        N_p = 0.0
+        delta_from_theta_hedge = 0.0
+        theta_from_theta_hedge = 0.0
+
+    mm_net_delta_post_gamma_hedge = mm_net_delta_initial + delta_from_gamma_hedge + delta_from_theta_hedge + total_delta_from_extras
+    mm_net_theta_post_hedge = mm_net_theta_initial + theta_from_theta_hedge + total_theta_from_extras
     underlying_hedge_qty = -mm_net_delta_post_gamma_hedge
 
-    st.markdown("#### Indicative Gamma Hedge Adjustment:")
-    cols_gamma_hedge = st.columns(3)
-    with cols_gamma_hedge[0]: st.metric("Gamma Hedger Delta (Dₕ)", f"{D_h:.4f}")
-    with cols_gamma_hedge[1]: st.metric("Gamma Hedger Gamma (Gₕ)", f"{G_h:.6f}")
-    with cols_gamma_hedge[2]: st.metric(f"Hedge Option Qty ({'Buy' if N_h > 0 else 'Sell'})", f"{abs(N_h):,.2f} units")
+    st.markdown("#### Indicative Gamma & Theta Hedge Adjustments:")
+    cols_hedge = st.columns(4)
+    with cols_hedge[0]: st.metric("Gamma Hedger Delta (Dₕ)", f"{D_h:.4f}" if gamma_hedger_selected else "N/A")
+    with cols_hedge[1]: st.metric("Gamma Hedger Gamma (Gₕ)", f"{G_h:.6f}" if gamma_hedger_selected else "N/A")
+    with cols_hedge[2]: st.metric(f"Gamma Hedge Qty ({'Buy' if N_h > 0 else 'Sell'})", f"{abs(N_h):,.2f} units" if gamma_hedger_selected else "N/A")
+    with cols_hedge[3]: st.metric("Put Delta (Dₚ)", f"{put_delta:.4f}" if theta_hedger_selected else "N/A")
 
     st.metric("Delta Change from Gamma Hedge", f"{delta_from_gamma_hedge:,.2f}")
-    st.metric("Delta from stETH/Inverse", f"{total_delta_from_extras:,.2f}")
+    st.metric("Delta Change from Theta Hedge", f"{delta_from_theta_hedge:,.2f}")
+    st.metric("Delta from stETH/Inverse/Short Puts", f"{total_delta_from_extras:,.2f}")
+    st.metric("Theta from Theta Hedge", f"{theta_from_theta_hedge:,.2f}")
+    st.metric("Theta from Short Puts", f"{total_theta_from_extras:,.2f}")
 
-    st.markdown("#### Indicative Final Delta Hedge (Post-Gamma Adj.):")
-    st.metric("MM Net Delta (After Gamma Hedge)", f"{mm_net_delta_post_gamma_hedge:,.2f}")
+    st.markdown("#### Indicative Final Delta & Theta Hedge:")
+    st.metric("MM Net Delta (After All Hedges)", f"{mm_net_delta_post_gamma_hedge:,.2f}")
+    st.metric("MM Net Theta (After All Hedges)", f"{mm_net_theta_post_hedge:,.2f}")
     action_underlying = "Buy" if underlying_hedge_qty > 0 else "Sell" if underlying_hedge_qty < 0 else "Hold"
     st.metric(f"Final Underlying Hedge ({action_underlying} Spot/Perp)", f"{abs(underlying_hedge_qty):,.2f} {st.session_state.selected_coin}")
 
     final_net_delta_book = mm_net_delta_post_gamma_hedge + underlying_hedge_qty
     st.success(f"**Resulting Book Net Delta (Post-All Adjustments):** {final_net_delta_book:,.4f} (should be ~0)")
+    st.caption("This indicates the spot/perp hedge needed for the MM to become delta-neutral after neutralizing gamma and theta with the chosen options and extras.")
 
 # --- Plotting Functions (Optimized) ---
 @st.cache_data(ttl=300)
@@ -326,13 +364,76 @@ def plot_open_interest_delta(ticker_list, spot_price):
     fig.add_hline(y=-0.5, line_dash="dot", line_color="grey")
     st.plotly_chart(fig, use_container_width=True)
 
+@st.cache_data(ttl=300)
+def plot_intraday_premium_spikes(df_options_hist, df_spot_hist, coin_symbol, spot_price_latest, selected_expiry_str):
+    st.subheader(f"Intraday Premium Spikes ({coin_symbol} - {selected_expiry_str})")
+    if df_options_hist.empty:
+        st.info("Premium Spikes: Historical option data is empty.")
+        return
+    df_filtered = df_options_hist[df_options_hist['k'] < df_options_hist['spot_hist']].copy()
+    df_calls = df_filtered[df_filtered['option_type'] == 'C'].copy()
+    df_puts = df_filtered[df_filtered['option_type'] == 'P'].copy()
+    df_calls['pct_change'] = df_calls.groupby('instrument_name')['mark_price_close'].pct_change().fillna(0) * 100
+    df_puts['pct_change'] = df_puts.groupby('instrument_name')['mark_price_close'].pct_change().fillna(0) * 100
+    max_call_spike = df_calls['pct_change'].abs().max()
+    max_put_spike = df_puts['pct_change'].abs().max()
+    max_call_ts = df_calls.loc[df_calls['pct_change'].abs().idxmax(), 'date_time'] if not df_calls.empty else None
+    max_put_ts = df_puts.loc[df_puts['pct_change'].abs().idxmax(), 'date_time'] if not df_puts.empty else None
+    st.session_state['max_spike_call_pct'] = max_call_spike
+    st.session_state['max_spike_call_date'] = max_call_ts.date() if max_call_ts else None
+    st.session_state['max_spike_put_pct'] = max_put_spike
+    st.session_state['max_spike_put_date'] = max_put_ts.date() if max_put_ts else None
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
+    if not df_calls.empty: fig.add_trace(go.Scatter(x=df_calls['date_time'], y=df_calls['pct_change'], mode='lines'), row=1, col=1)
+    if not df_puts.empty: fig.add_trace(go.Scatter(x=df_puts['date_time'], y=df_puts['pct_change'], mode='lines'), row=2, col=1)
+    fig.update_layout(height=600)
+    st.plotly_chart(fig)
+
+@st.cache_data(ttl=300)
+def compute_and_plot_itm_gex_ratio(dft, df_krak_5m, spot_price_latest, selected_expiry_obj):
+    st.subheader(f"ITM Put/Call GEX Ratio (Expiry: {selected_expiry_obj.strftime('%d%b%y')})")
+    if dft.empty or df_krak_5m.empty:
+        st.info("GEX Ratio: Data insufficient.")
+        return pd.DataFrame()
+    df_merged_gex = pd.merge_asof(dft.sort_values('date_time'), df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_price'}), on='date_time', direction='nearest', tolerance=pd.Timedelta('15min')).dropna(subset=['spot_price'])
+    df_merged_gex['gamma'] = compute_greeks_vectorized(df_merged_gex, df_merged_gex['spot_price'].values, df_merged_gex['date_time'].values)['gamma'].values
+    df_merged_gex['gex'] = df_merged_gex['gamma'] * df_merged_gex['open_interest'] * (df_merged_gex['spot_price'] ** 2) * 0.01
+    df_merged_gex['is_itm_call'] = (df_merged_gex['option_type'] == 'C') & (df_merged_gex['k'] < df_merged_gex['spot_price'])
+    df_merged_gex['is_itm_put'] = (df_merged_gex['option_type'] == 'P') & (df_merged_gex['k'] > df_merged_gex['spot_price'])
+    df_agg = df_merged_gex.groupby('date_time').agg({'gex': ['sum', lambda x: x[df_merged_gex['is_itm_call']].sum(), lambda x: x[df_merged_gex['is_itm_put']].sum()]}).reset_index()
+    df_agg.columns = ['date_time', 'total_gex', 'total_itm_call_gex', 'total_itm_put_gex']
+    df_agg['itm_gex_ratio'] = df_agg['total_itm_put_gex'] / (df_agg['total_itm_call_gex'] + 1e-9)
+    df_plot_final = pd.merge_asof(df_agg.sort_values('date_time'), df_krak_5m[['date_time', 'close']], on='date_time', direction='nearest', tolerance=pd.Timedelta('5min')).dropna()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(x=df_plot_final['date_time'], y=df_plot_final['itm_gex_ratio'], name='ITM P/C GEX Ratio'), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_plot_final['date_time'], y=df_plot_final['close'], name=f'{coin_symbol} Spot Price'), secondary_y=True)
+    fig.update_layout(title=f"{coin_symbol} Intraday - Spot: ${spot_price_latest:,.2f}, ITM P/C GEX Ratio", height=500)
+    st.plotly_chart(fig)
+    st.metric("Latest ITM P/C GEX Ratio", f"{df_plot_final['itm_gex_ratio'].iloc[-1]:.2f}")
+    return df_plot_final
+
+@st.cache_data(ttl=300)
+def plot_matrix_hedge_thalex(portfolio_state_df, hedge_actions_df, symbol):
+    st.subheader(f"Matrix Delta Hedging Simulation ({symbol} - MM Short Book)")
+    if portfolio_state_df.empty:
+        st.info("No data for Matrix Delta Hedging plot.")
+        return
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": True}]], subplot_titles=("Net Portfolio Delta & Components", f"Hedge Position ({symbol}) & Spot Price", "Cumulative P&L and Costs"))
+    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_delta_final'], name='Net Portfolio Delta'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n1'], name='Underlying Hedge Qty'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['spot_price'], name='Spot Price'), row=2, col=1, secondary_y=True)
+    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['cumulative_pnl'], name='Cumulative P&L'), row=3, col=1)
+    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['cumulative_trading_costs'], name='Cumulative Costs'), row=3, col=1, secondary_y=True)
+    fig.update_layout(height=800)
+    st.plotly_chart(fig)
+
 # --- Main Function ---
 def main():
     st.set_page_config(layout="wide", page_title="Advanced Options Hedging & MM Dashboard")
     login()
 
     if 'selected_coin' not in st.session_state: st.session_state.selected_coin = "BTC"
-    if 'snapshot_time' not in st.session_state: st.session_state.snapshot_time = dt.datetime.now(dt.timezone.utc)
+    if 'snapshot_time' not in st.session_state: st.session_state.snapshot_time = CURRENT_TIME_UTC
     if 'risk_free_rate_input' not in st.session_state: st.session_state.risk_free_rate_input = 0.01
 
     st.title(f"{st.session_state.selected_coin} Options: Advanced Hedging & MM Perspective")
@@ -349,11 +450,11 @@ def main():
 
     st.session_state.risk_free_rate_input = st.sidebar.number_input("Risk-Free Rate (Annualized)", value=st.session_state.risk_free_rate_input, min_value=0.0, max_value=0.2, step=0.001, format="%.3f", key="main_rf_rate_adv_vFull2_final")
     risk_free_rate = st.session_state.risk_free_rate_input
-    st.session_state.snapshot_time = dt.datetime.now(dt.timezone.utc)
+    st.session_state.snapshot_time = CURRENT_TIME_UTC
 
     pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7, key="pair_sim_lookback_days_adv_vFull2_final")
     spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1, key="spot_merge_tolerance_adv_vFull2_final")
-    df_krak_5m = fetch_krak_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))
+    df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))  # Corrected function name
     df_spot_hist = df_krak_5m
     spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
 
@@ -470,6 +571,8 @@ def main():
         cols_greeks_adv[1].metric("Net Gamma", f"{net_g_mm:,.4f}")
         net_v_mm = -(dft_latest['vega'] * dft_latest['open_interest']).sum()
         cols_greeks_adv[2].metric("Net Vega", f"{net_v_mm:,.0f}")
+        net_t_mm = -(dft_latest['theta'] * dft_latest['open_interest']).sum()
+        cols_greeks_adv[3].metric("Net Theta", f"{net_t_mm:,.2f}")
         display_mm_gamma_adjustment_analysis(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
 
     st.markdown("---"); st.header("Intraday Option Flow Indicators (Last 500 Mins)")
