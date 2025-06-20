@@ -15,8 +15,13 @@ import gc
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import re
 
-# Configure logging
+# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Version marker
+CODE_VERSION = "2025-06-20-v1"
+logger.info(f"Running code version: {CODE_VERSION}")
 
 # --- Constants ---
 BASE_URL = "https://thalex.com/api/v2/public"
@@ -31,18 +36,36 @@ REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
-
-# Current date and time: 05:44 PM EDT, June 20, 2025 = 21:44 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:44:00", tz="UTC")
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:50:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
 try:
     exchange1 = ccxt.bitget({'enableRateLimit': True})
-    logging.info("Successfully initialized Bitget exchange (exchange1).")
+    logger.info("Successfully initialized Bitget exchange.")
 except Exception as e:
     st.error(f"Failed to connect to Bitget: {e}")
-    logging.error(f"Failed to initialize Bitget exchange (exchange1): {e}", exc_info=True)
+    logger.error(f"Failed to initialize Bitget exchange: {e}", exc_info=True)
+
+# --- Streamlit Configuration ---
+st.set_page_config(page_title="Advanced Options Hedging & MM Dashboard", layout="wide")
+st.title("Advanced Options Hedging & Market Maker Dashboard")
+st.write(f"Code Version: {CODE_VERSION}")
+
+# --- Sidebar ---
+st.sidebar.header("Configuration")
+coin_options = ["BTC", "ETH"]
+if 'selected_coin' not in st.session_state:
+    st.session_state.selected_coin = "BTC"
+selected_coin = st.sidebar.selectbox("Cryptocurrency", coin_options, index=coin_options.index(st.session_state.selected_coin))
+if selected_coin != st.session_state.selected_coin:
+    st.session_state.selected_coin = selected_coin
+    st.rerun()
+coin = st.session_state.selected_coin
+
+risk_free_rate = st.sidebar.number_input("Risk-Free Rate (Annualized)", value=0.01, min_value=0.0, max_value=0.2, step=0.001, format="%.3f")
+pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7)
+spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1)
 
 # --- Utility Functions ---
 
@@ -58,7 +81,7 @@ def load_credentials():
             return {}
         return dict(zip(users, pwds))
     except FileNotFoundError:
-        st.error("Credential files (usernames.txt, passwords.txt) not found.")
+        st.error("Credential files not found.")
         return {}
     except Exception as e:
         st.error(f"Error loading credentials: {e}")
@@ -99,11 +122,11 @@ def fetch_instruments():
         resp = requests.get(URL_INSTRUMENTS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         instruments = resp.json().get("result", [])
-        logging.info(f"Sample instruments: {[i.get('instrument_name', '') for i in instruments[:10]]}")
+        logger.info(f"Sample instruments: {[i.get('instrument_name', '') for i in instruments[:10]]}")
         return instruments
     except Exception as e:
         st.error(f"Error fetching instruments: {e}")
-        logging.error(f"Error fetching instruments: {e}", exc_info=True)
+        logger.error(f"Error fetching instruments: {e}", exc_info=True)
         return []
 
 @retry(stop=stop_after_attempt(RETRY_ATTEMPTS), wait=wait_fixed(RETRY_DELAY), retry=retry_if_exception_type(requests.exceptions.RequestException))
@@ -114,7 +137,7 @@ def fetch_ticker(instr_name):
         r.raise_for_status()
         return r.json().get("result", {})
     except requests.exceptions.RequestException as e:
-        logging.warning(f"Error fetching ticker {instr_name}: {e}")
+        logger.warning(f"Error fetching ticker {instr_name}: {e}")
         return {}
 
 @st.cache_data(ttl=600)
@@ -127,7 +150,7 @@ def fetch_ticker_batch(instrument_names):
                 instr = future_to_instr[future]
                 ticker_data[instr] = future.result()
     except Exception as e:
-        logging.warning(f"Batch ticker fetch failed: {e}. Falling back to sequential.")
+        logger.warning(f"Batch ticker fetch failed: {e}. Falling back to sequential.")
         for instr in instrument_names:
             ticker_data[instr] = fetch_ticker(instr)
     return ticker_data
@@ -136,7 +159,7 @@ def fetch_ticker_batch(instrument_names):
 def fetch_data(instruments_tuple, historical_lookback_days=7):
     instr = list(instruments_tuple)
     if not instr:
-        logging.warning("fetch_data: instruments_tuple is empty.")
+        logger.warning("fetch_data: instruments_tuple is empty.")
         return pd.DataFrame()
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = list(executor.map(lambda x: fetch_single_instrument_data(x, historical_lookback_days), instr))
@@ -149,13 +172,10 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True, errors='coerce')
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].apply(
-        lambda x: pd.Timestamp(
-            year=x.year, month=x.month, day=x.day,
-            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
-        ) if pd.notnull(x) else x
+        lambda x: pd.Timestamp(x.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC') if pd.notnull(x) else x
     )
     if dfc['expiry_datetime_col'].isna().any():
-        logging.warning(f"NaT values in expiry_datetime_col: {dfc['expiry_datetime_col'].isna().sum()}. Dropping these rows.")
+        logger.warning(f"NaT values in expiry_datetime_col: {dfc['expiry_datetime_col'].isna().sum()}. Dropping these rows.")
         dfc = dfc.dropna(subset=['expiry_datetime_col'])
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
@@ -170,7 +190,7 @@ def fetch_single_instrument_data(name, days):
             return pd.DataFrame(marks, columns=COLUMNS).assign(instrument_name=name)
         return pd.DataFrame()
     except Exception as e:
-        logging.error(f"fetch_single_instrument_data: Error for {name}: {e}")
+        logger.error(f"fetch_single_instrument_data: Error for {name}: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=600)
@@ -207,76 +227,64 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
             return pd.DataFrame([{'date_time': pd.to_datetime(e['timestamp'], unit='ms', utc=True), 'funding_rate': e['fundingRate'] * 365 * 3} for e in hist])
         return pd.DataFrame()
     except Exception as e:
-        logging.error(f"Error fetching funding rates for {symbol}: {e}")
+        logger.error(f"Error fetching funding rates for {symbol}: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=600)
 def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
-        logging.warning("No instruments returned from fetch_instruments.")
+        logger.warning("No instruments returned. Using default expiry.")
         default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
-        default_expiry = pd.Timestamp(
-            year=default_expiry.year, month=default_expiry.month, day=default_expiry.day,
-            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
-        )
+        default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
         return [default_expiry]
-    expiry_dates = []
-    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
+    
     # Regex to validate instrument_name (e.g., BTC-27JUN25-50000-C)
     instr_pattern = re.compile(r'^[A-Z]+-\d{2}[A-Z]{3}\d{2}-[0-9.]+-[CP]$')
+    expiry_date_strings = []
     for i in instruments:
         instr_name = i.get("instrument_name", "")
         if not instr_pattern.match(instr_name):
-            logging.debug(f"Invalid instrument format: {instr_name}")
+            logger.debug(f"Invalid instrument format: {instr_name}")
             continue
         parts = instr_name.split("-")
         date_str = parts[1]
         try:
-            # Parse date as UTC
-            exp_date = pd.to_datetime(date_str, format="%d%b%y", utc=True, errors='raise')
-            # Set time to 08:00 UTC using pd.Timestamp
-            exp_date = pd.Timestamp(
-                year=exp_date.year, month=exp_date.month, day=exp_date.day,
-                hour=8, minute=0, second=0, microsecond=0, tz='UTC'
-            )
-            logging.debug(f"Parsed expiry for {instr_name}: {exp_date}, tz: {exp_date.tzinfo}")
-            expiry_dates.append(exp_date)
+            pd.to_datetime(date_str, format="%d%b%y", errors='raise')
+            expiry_date_strings.append(date_str)
+            logger.debug(f"Valid date string for {instr_name}: {date_str}")
         except (ValueError, TypeError) as e:
-            logging.warning(f"Failed to parse date '{date_str}' in instrument {instr_name}: {e}")
+            logger.warning(f"Failed to validate date '{date_str}' in instrument {instr_name}: {e}")
             continue
-    # Deduplicate and sort
-    unique_expiries = sorted(list(set(expiry_dates)))
-    if not unique_expiries:
-        logging.warning("No valid expiry dates found. Returning default expiry.")
-        default_expiry = current_date_utc_ts + pd.Timedelta(days=7)
-        default_expiry = pd.Timestamp(
-            year=default_expiry.year, month=default_expiry.month, day=default_expiry.day,
-            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
-        )
+    
+    # Deduplicate date strings
+    unique_date_strings = sorted(list(set(expiry_date_strings)))
+    if not unique_date_strings:
+        logger.warning("No valid expiry dates found. Using default expiry.")
+        default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
+        default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
         return [default_expiry]
-    # Filter future expiries
+    
+    # Convert to UTC-aware timestamps
+    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
     future_expiries = []
-    for exp in unique_expiries:
-        if exp.tzinfo is None:
-            logging.error(f"Naive timestamp detected: {exp}. Localizing to UTC.")
-            exp = exp.tz_localize('UTC')
-        elif exp.tzinfo != dt.timezone.utc:
-            logging.warning(f"Non-UTC timezone for {exp}: {exp.tzinfo}. Converting to UTC.")
-            exp = exp.tz_convert('UTC')
+    for date_str in unique_date_strings:
         try:
-            if exp > current_date_utc_ts:
-                future_expiries.append(exp)
-            else:
-                logging.debug(f"Skipping past or equal expiry {exp} vs {current_date_utc_ts}")
-        except TypeError as e:
-            logging.error(f"Timezone comparison error for {exp}: {e}")
+            exp_date = pd.to_datetime(f"{date_str} 08:00:00", format="%d%b%y %H:%M:%S", utc=True)
+            if exp_date.tzinfo is None:
+                logger.error(f"Naive timestamp detected for {date_str}: {exp_date}. Localizing to UTC.")
+                exp_date = exp_date.tz_localize('UTC')
+            if exp_date > current_date_utc_ts:
+                future_expiries.append(exp_date)
+            logger.debug(f"Processed expiry {exp_date}, tz: {exp_date.tzinfo}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to process date '{date_str}': {e}")
             continue
-    logging.info(f"current_date_utc_ts: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
-    logging.info(f"Future expiries: {future_expiries[:5]}, tz: {[x.tz for x in future_expiries]}")
+    
+    logger.info(f"Current date: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
+    logger.info(f"Future expiries: {future_expiries[:5]}, tz: {[x.tz for x in future_expiries]}")
     return future_expiries if future_expiries else [pd.Timestamp(
-        year=current_date_utc_ts.year, month=current_date_utc_ts.month, day=current_date_utc_ts.day,
-        hour=8, minute=0, second=0, microsecond=0, tz='UTC'
+        current_date_utc_ts.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC'
     ) + pd.Timedelta(days=7)]
 
 @st.cache_data(ttl=600)
@@ -290,13 +298,13 @@ def get_option_instruments(instruments, option_type, expiry_str, coin):
 @st.cache_data(ttl=600)
 def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=0.0):
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
-        logging.warning("Invalid input for compute_greeks_vectorized: empty or missing columns.")
+        logger.warning("Invalid input for compute_greeks_vectorized: empty or missing columns.")
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
     snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc, tz='UTC')
     df['expiry_datetime_col'] = pd.to_datetime(df['expiry_datetime_col'], utc=True, errors='coerce')
     if df['expiry_datetime_col'].isna().any():
-        logging.warning(f"NaT values in expiry_datetime_col: {df['expiry_datetime_col'].isna().sum()}. Filling with snapshot_time_utc.")
+        logger.warning(f"NaT values in expiry_datetime_col: {df['expiry_datetime_col'].isna().sum()}. Filling with snapshot_time_utc.")
         df['expiry_datetime_col'] = df['expiry_datetime_col'].fillna(snapshot_time_utc_ts)
     
     T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds().fillna(0) / (365 * 24 * 3600)
@@ -466,97 +474,63 @@ def compute_and_plot_itm_gex_ratio(dft, df_krak_5m, spot_price_latest, selected_
 
 # --- Main Function ---
 def main():
-    st.set_page_config(layout="wide", page_title="Advanced Options Hedging & MM Dashboard")
     login()
-
-    if 'selected_coin' not in st.session_state:
-        st.session_state.selected_coin = "BTC"
-    elif not isinstance(st.session_state.selected_coin, str):
-        st.session_state.selected_coin = str(st.session_state.selected_coin)
-    if 'snapshot_time' not in st.session_state:
-        st.session_state.snapshot_time = pd.Timestamp(CURRENT_TIME_UTC, tz='UTC')
-    if 'risk_free_rate_input' not in st.session_state:
-        st.session_state.risk_free_rate_input = 0.01
-
-    st.title(f"{st.session_state.selected_coin} Options: Advanced Hedging & MM Perspective")
-    if st.sidebar.button("Logout"):
-        st.session_state.logged_in = False
-        st.rerun()
-
-    st.sidebar.header("Configuration")
-    coin_options = ["BTC", "ETH"]
-    current_coin_idx = coin_options.index(st.session_state.selected_coin) if st.session_state.selected_coin in coin_options else 0
-    selected_coin_widget = st.sidebar.selectbox("Cryptocurrency", coin_options, index=current_coin_idx, key="main_coin_select_adv_vFull2_final")
-    if selected_coin_widget != st.session_state.selected_coin:
-        st.session_state.selected_coin = selected_coin_widget
-        st.rerun()
-    coin = st.session_state.selected_coin
-
-    st.session_state.risk_free_rate_input = st.sidebar.number_input(
-        "Risk-Free Rate (Annualized)", value=st.session_state.risk_free_rate_input, min_value=0.0, max_value=0.2, step=0.001, format="%.3f", key="main_rf_rate_adv_vFull2_final"
-    )
-    risk_free_rate = st.session_state.risk_free_rate_input
     st.session_state.snapshot_time = pd.Timestamp(CURRENT_TIME_UTC, tz='UTC')
 
-    pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7, key="pair_sim_lookback_days_adv_vFull2_final")
-    spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1, key="spot_merge_tolerance_adv_vFull2_final")
-    df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))
-    df_spot_hist = df_krak_5m
-    spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
+    with st.spinner("Fetching market data..."):
+        df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))
+        df_spot_hist = df_krak_5m
+        spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
 
-    all_instruments_list = fetch_instruments()
-    if not all_instruments_list:
-        st.error("Failed to fetch instruments list.")
-        st.stop()
+        all_instruments_list = fetch_instruments()
+        if not all_instruments_list:
+            st.error("Failed to fetch instruments list.")
+            st.stop()
 
-    current_snapshot_time = st.session_state.snapshot_time
-    valid_expiries = get_valid_expiration_options(current_snapshot_time)
-    if not valid_expiries:
-        st.error(f"No valid expiries for {coin}. Using default expiry.")
-        default_expiry = current_snapshot_time + pd.Timedelta(days=7)
-        default_expiry = pd.Timestamp(
-            year=default_expiry.year, month=default_expiry.month, day=default_expiry.day,
-            hour=8, minute=0, second=0, microsecond=0, tz='UTC'
+        current_snapshot_time = st.session_state.snapshot_time
+        valid_expiries = get_valid_expiration_options(current_snapshot_time)
+        if not valid_expiries:
+            st.error(f"No valid expiries for {coin}. Using default expiry.")
+            default_expiry = current_snapshot_time + pd.Timedelta(days=7)
+            default_expiry = pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')
+            valid_expiries = [default_expiry]
+
+        default_exp_idx = 0
+        if len(valid_expiries) > 1:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_expiry = {
+                    executor.submit(
+                        lambda x: (
+                            x,
+                            np.sum([
+                                fetch_ticker(instr).get('open_interest', 0)
+                                for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] +
+                                get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]
+                            ])
+                        ),
+                        exp
+                    ): exp for exp in valid_expiries
+                }
+                expiry_oi_map = {}
+                for future in as_completed(future_to_expiry):
+                    try:
+                        expiry, oi = future.result()
+                        expiry_oi_map[expiry] = oi
+                    except Exception as e:
+                        logger.warning(f"Error processing expiry: {e}")
+                if not expiry_oi_map:
+                    st.error("No valid open interest data for expiries.")
+                    st.stop()
+                best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
+                default_exp_idx = valid_expiries.index(best_expiry_by_oi)
+
+        selected_expiry = st.sidebar.selectbox(
+            "Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y")
         )
-        valid_expiries = [default_expiry]
-
-    default_exp_idx = 0
-    if len(valid_expiries) > 1:
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_expiry = {
-                executor.submit(
-                    lambda x: (
-                        x,
-                        np.sum([
-                            fetch_ticker(instr).get('open_interest', 0)
-                            for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] +
-                            get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]
-                        ])
-                    ),
-                    exp
-                ): exp for exp in valid_expiries
-            }
-            expiry_oi_map = {}
-            for future in as_completed(future_to_expiry):
-                try:
-                    expiry, oi = future.result()
-                    expiry_oi_map[expiry] = oi
-                except Exception as e:
-                    logging.warning(f"Error processing expiry in future: {e}")
-            if not expiry_oi_map:
-                st.error("No valid open interest data for expiries.")
-                st.stop()
-            best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-            default_exp_idx = valid_expiries.index(best_expiry_by_oi)
-
-    selected_expiry = st.sidebar.selectbox(
-        "Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"),
-        key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default"
-    )
-    e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
-    all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
-    all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
-    all_instr_selected_expiry = np.sort(np.concatenate([all_calls_expiry, all_puts_expiry]))
+        e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
+        all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
+        all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
+        all_instr_selected_expiry = np.sort(np.concatenate([all_calls_expiry, all_puts_expiry]))
 
     st.header(f"Analysis: {coin} | Expiry: {e_str} | Spot: ${spot_price:,.2f}" if not np.isnan(spot_price) else f"Analysis: {coin} | Expiry: {e_str} | Spot: N/A")
     st.markdown(f"*Snapshot: {st.session_state.snapshot_time.strftime('%Y-%m-%d %H:%M:%S UTC')} | RF Rate: {risk_free_rate:.3%}*")
@@ -564,41 +538,43 @@ def main():
     if not all_instr_selected_expiry.size:
         st.error(f"No options for {e_str}.")
         st.stop()
-    dft_raw = fetch_data(all_instr_selected_expiry, historical_lookback_days=pair_sim_lookback_days)
-    ticker_data = fetch_ticker_batch(all_instr_selected_expiry)
-    valid_tickers = np.array([k for k, v in ticker_data.items() if v and isinstance(v.get('iv'), (int, float)) and v.get('iv', 0) > 1e-4 and pd.notna(v.get('open_interest'))])
-    dft = dft_raw[dft_raw['instrument_name'].isin(valid_tickers)].copy() if not dft_raw.empty else pd.DataFrame()
-    if not dft.empty:
-        dft['open_interest'] = np.array([ticker_data.get(x, {}).get('open_interest', 0.0) for x in dft['instrument_name']])
-        dft['iv_close'] = pd.to_numeric(dft['iv_close'], errors='coerce')
 
-    dft_with_hist_greeks = pd.DataFrame()
-    if not dft.empty and not df_krak_5m.empty:
-        merged_hist = pd.merge_asof(
-            dft.sort_values('date_time'),
-            df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}),
-            on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)
-        ).dropna(subset=['spot_hist'])
-        if not merged_hist.empty:
-            with st.spinner("Calculating Greeks (Delta, Gamma, Vega, Theta) on historical data..."):
-                dft_with_hist_greeks = compute_greeks_vectorized(
-                    merged_hist, merged_hist['spot_hist'].values, merged_hist['date_time'].values, risk_free_rate
-                )
+    with st.spinner("Processing option data..."):
+        dft_raw = fetch_data(all_instr_selected_expiry, historical_lookback_days=pair_sim_lookback_days)
+        ticker_data = fetch_ticker_batch(all_instr_selected_expiry)
+        valid_tickers = np.array([k for k, v in ticker_data.items() if v and isinstance(v.get('iv'), (int, float)) and v.get('iv', 0) > 1e-4 and pd.notna(v.get('open_interest'))])
+        dft = dft_raw[dft_raw['instrument_name'].isin(valid_tickers)].copy() if not dft_raw.empty else pd.DataFrame()
+        if not dft.empty:
+            dft['open_interest'] = np.array([ticker_data.get(x, {}).get('open_interest', 0.0) for x in dft['instrument_name']])
+            dft['iv_close'] = pd.to_numeric(dft['iv_close'], errors='coerce')
 
-    dft_latest = pd.DataFrame()
-    if not dft.empty and not np.isnan(spot_price):
-        dft_latest_idx = dft.groupby('instrument_name')['date_time'].idxmax()
-        dft_latest = dft.loc[dft_latest_idx].copy()
-        if not dft_latest.empty:
-            dft_latest['open_interest'] = np.array([ticker_data.get(x, {}).get('open_interest', 0.0) for x in dft_latest['instrument_name']])
-            dft_latest = compute_greeks_vectorized(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
+        dft_with_hist_greeks = pd.DataFrame()
+        if not dft.empty and not df_krak_5m.empty:
+            merged_hist = pd.merge_asof(
+                dft.sort_values('date_time'),
+                df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}),
+                on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)
+            ).dropna(subset=['spot_hist'])
+            if not merged_hist.empty:
+                with st.spinner("Calculating Greeks..."):
+                    dft_with_hist_greeks = compute_greeks_vectorized(
+                        merged_hist, merged_hist['spot_hist'].values, merged_hist['date_time'].values, risk_free_rate
+                    )
+
+        dft_latest = pd.DataFrame()
+        if not dft.empty and not np.isnan(spot_price):
+            dft_latest_idx = dft.groupby('instrument_name')['date_time'].idxmax()
+            dft_latest = dft.loc[dft_latest_idx].copy()
+            if not dft_latest.empty:
+                dft_latest['open_interest'] = np.array([ticker_data.get(x, {}).get('open_interest', 0.0) for x in dft_latest['instrument_name']])
+                dft_latest = compute_greeks_vectorized(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
 
     def safe_plot_exec(plot_func, *args, **kwargs):
         try:
             plot_func(*args, **kwargs)
         except Exception as e:
             st.error(f"Plot error in {plot_func.__name__}: {e}")
-            logging.error(f"Plot error in {plot_func.__name__}", exc_info=True)
+            logger.error(f"Plot error in {plot_func.__name__}", exc_info=True)
 
     if not dft_latest.empty:
         ticker_list_latest_snap = np.array([
@@ -612,7 +588,8 @@ def main():
             safe_plot_exec(plot_open_interest_delta, ticker_list_latest_snap, spot_price)
             safe_plot_exec(plot_delta_balance, ticker_list_latest_snap, spot_price)
 
-    st.markdown("---"); st.header("Market Maker Perspective")
+    st.markdown("---")
+    st.header("Market Maker Perspective")
     if not dft_latest.empty:
         st.subheader("Net Greek Exposures (Latest Snapshot - MM Short Book)")
         cols_greeks_adv = st.columns(5)
@@ -626,7 +603,8 @@ def main():
         cols_greeks_adv[3].metric("Net Theta", f"{net_t_mm:,.2f}")
         display_mm_gamma_adjustment_analysis(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
 
-    st.markdown("---"); st.header("Raw Data Tables (Debug)")
+    st.markdown("---")
+    st.header("Raw Data Tables (Debug)")
     with st.expander("dft_raw (Initial Fetch - Head)"):
         st.dataframe(dft_raw.head(20))
     with st.expander("dft (After Current Ticker Filter - Head)"):
@@ -635,7 +613,7 @@ def main():
         st.dataframe(dft_with_hist_greeks.head(20))
 
     gc.collect()
-    logging.info(f"--- ADVANCED Dashboard rendering complete for {coin} {e_str} ---")
+    logger.info(f"--- Dashboard rendering complete for {coin} {e_str} ---")
 
 if __name__ == "__main__":
     main()
