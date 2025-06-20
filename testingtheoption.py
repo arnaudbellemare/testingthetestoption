@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Version marker
-CODE_VERSION = "2025-06-20-v12"
+CODE_VERSION = "2025-06-20-v13"
 logger.info(f"Running code version: {CODE_VERSION}")
 
 # --- Constants ---
@@ -143,11 +143,8 @@ def fetch_ticker(instr_name):
 def fetch_ticker_batch(instrument_names):
     ticker_data = {}
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_to_instr = {executor.submit(fetch_ticker, instr): instr for instr in instrument_names}
-            for future in as_completed(future_to_instr):
-                instr = future_to_instr[future]
-                ticker_data[instr] = future.result()
+        for instr in instrument_names:
+            ticker_data[instr] = fetch_ticker(instr)
     except Exception as e:
         logger.warning(f"Batch ticker fetch failed: {e}. Falling back to sequential.")
         for instr in instrument_names:
@@ -160,8 +157,7 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     if not instr:
         logger.warning("fetch_data: instruments_tuple is empty.")
         return pd.DataFrame()
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(lambda x: fetch_single_instrument_data(x, historical_lookback_days), instr))
+    results = [fetch_single_instrument_data(x, historical_lookback_days) for x in instr]
     dfs = [df for df in results if not df.empty]
     if not dfs:
         return pd.DataFrame()
@@ -171,7 +167,7 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True, errors='coerce')
     dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].apply(
-        lambda x: pd.Timestamp(x.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC') if pd.notnull(x) else x
+        lambda x: pd.Timestamp(f"{x.strftime('%Y-%m-%d')} 08:00:00+00:00", tz='UTC') if pd.notnull(x) else x
     )
     if dfc['expiry_datetime_col'].isna().any():
         logger.warning(f"NaT values in expiry_datetime_col: {dfc['expiry_datetime_col'].isna().sum()}. Dropping these rows.")
@@ -235,7 +231,7 @@ def get_valid_expiration_options(current_date_utc):
     if not instruments:
         logger.warning("No instruments returned. Using default expiry.")
         default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
-        return [pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')]
+        return [pd.Timestamp(f"{default_expiry.strftime('%Y-%m-%d')} 08:00:00+00:00", tz='UTC')]
     
     # Regex to validate instrument_name (e.g., BTC-27JUN25-50000-C)
     instr_pattern = re.compile(r'^[A-Z]+-\d{2}[A-Z]{3}\d{2}-[0-9.]+-[CP]$')
@@ -260,7 +256,7 @@ def get_valid_expiration_options(current_date_utc):
     if not unique_date_strings:
         logger.warning("No valid expiry dates found. Using default expiry.")
         default_expiry = pd.Timestamp(current_date_utc, tz='UTC') + pd.Timedelta(days=7)
-        return [pd.Timestamp(default_expiry.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC')]
+        return [pd.Timestamp(f"{default_expiry.strftime('%Y-%m-%d')} 08:00:00+00:00", tz='UTC')]
     
     # Convert to UTC-aware timestamps and filter
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
@@ -278,7 +274,7 @@ def get_valid_expiration_options(current_date_utc):
     logger.info(f"Current date: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
     logger.info(f"Future expiries: {future_expiries[:5]}, tz: {[x.tz for x in future_expiries]}")
     return future_expiries if future_expiries else [pd.Timestamp(
-        current_date_utc_ts.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC'
+        f"{current_date_utc_ts.strftime('%Y-%m-%d')} 08:00:00+00:00", tz='UTC'
     ) + pd.Timedelta(days=7)]
 
 @st.cache_data(ttl=600)
@@ -485,7 +481,7 @@ def main():
         valid_expiries = get_valid_expiration_options(current_snapshot_time)
         if not valid_expiries:
             st.error(f"No valid expiries for {coin}. Using default expiry.")
-            default_expiry = pd.Timestamp(current_snapshot_time.strftime('%Y-%m-%d 08:00:00+00:00'), tz='UTC') + pd.Timedelta(days=7)
+            default_expiry = pd.Timestamp(f"{current_snapshot_time.strftime('%Y-%m-%d')} 08:00:00+00:00", tz='UTC') + pd.Timedelta(days=7)
             valid_expiries = [default_expiry]
 
         default_exp_idx = 0
