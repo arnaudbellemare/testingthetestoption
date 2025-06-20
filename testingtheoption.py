@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:20 PM EDT, June 20, 2025 = 19:20 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 20, tzinfo=dt.timezone.utc)
+# Current date and time: 03:35 PM EDT, June 20, 2025 = 19:35 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 35, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -133,7 +133,7 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     if not dfs:
         return pd.DataFrame()
     dfc = pd.concat(dfs, ignore_index=True)
-    dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True).dt.tz_localize('UTC')
+    dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True)  # Removed tz_localize since utc=True already sets UTC
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC').dt.replace(hour=8)
@@ -473,13 +473,6 @@ def main():
     all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
     all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
     all_instr_selected_expiry = np.sort(np.concatenate([all_calls_expiry, all_puts_expiry]))
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Pair Delta Hedge Sim (OTM)")
-    sel_call_pair_default_idx = min(len(all_calls_expiry)-1, int(len(all_calls_expiry)*0.7)) if all_calls_expiry.size else 0
-    sel_call_pair = st.sidebar.selectbox("OTM Call:", np.sort(all_calls_expiry), index=sel_call_pair_default_idx, key=f"main_pair_call_adv_vFull2_final_{e_str}_{coin}", disabled=not all_calls_expiry.size)
-    sel_put_pair_default_idx = max(0, int(len(all_puts_expiry)*0.3)-1) if all_puts_expiry.size else 0
-    sel_put_pair = st.sidebar.selectbox("OTM Put:", np.sort(all_puts_expiry), index=sel_put_pair_default_idx, key=f"main_pair_put_adv_vFull2_final_{e_str}_{coin}", disabled=not all_puts_expiry.size)
 
     st.header(f"Analysis: {coin} | Expiry: {e_str} | Spot: ${spot_price:,.2f}" if not np.isnan(spot_price) else f"Analysis: {coin} | Expiry: {e_str} | Spot: N/A")
     st.markdown(f"*Snapshot: {st.session_state.snapshot_time.strftime('%Y-%m-%d %H:%M:%S UTC')} | RF Rate: {risk_free_rate:.3%}*")
