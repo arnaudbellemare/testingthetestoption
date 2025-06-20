@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 02:35 PM EDT, June 20, 2025 = 18:35 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 18, 35, tzinfo=dt.timezone.utc)
+# Current date and time: 02:47 PM EDT, June 20, 2025 = 18:47 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 18, 47, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -197,6 +197,26 @@ def fetch_funding_rates(exchange_instance, symbol='BTC/USDT', days=7):
     except Exception as e:
         logging.error(f"Error fetching funding rates for {symbol}: {e}")
         return pd.DataFrame()
+
+@st.cache_data(ttl=600)
+def get_valid_expiration_options(current_date_utc):
+    instruments = fetch_instruments()
+    if not instruments:
+        return []
+    exp_dates = set()
+    for instr in instruments:
+        try:
+            parts = instr.get("instrument_name", "").split("-")
+            if len(parts) >= 3 and parts[-1] in ['C', 'P']:
+                expiry_date = dt.datetime.strptime(parts[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8)
+                if expiry_date > current_date_utc:
+                    exp_dates.add(expiry_date)
+        except Exception:
+            continue
+    return sorted(list(exp_dates))
+
+def get_option_instruments(instruments, option_type, expiry_str, coin):
+    return sorted([i["instrument_name"] for i in instruments if i.get("instrument_name", "").startswith(f"{coin}-{expiry_str}") and i.get("instrument_name", "").endswith(f"-{option_type}")])
 
 # --- Greek Calculations (Vectorized) ---
 def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=0.0):
@@ -454,7 +474,7 @@ def main():
 
     pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7, key="pair_sim_lookback_days_adv_vFull2_final")
     spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1, key="spot_merge_tolerance_adv_vFull2_final")
-    df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))  # Corrected function name
+    df_krak_5m = fetch_kraken_data(coin=coin, days=max(10, pair_sim_lookback_days + 2))
     df_spot_hist = df_krak_5m
     spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
 
