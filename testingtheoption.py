@@ -11,7 +11,6 @@ from scipy.stats import norm
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import Pool
 import gc
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
@@ -29,11 +28,11 @@ URL_TICKER = f"{BASE_URL}/{TICKER_ENDPOINT}"
 COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_price_close", "iv_open", "iv_high", "iv_low", "iv_close", "mark_volume"]
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
-RETRY_ATTEMPTS = 3  # Number of retry attempts for API calls
-RETRY_DELAY = 2     # Delay between retries in seconds
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2
 
-# Current date and time: 03:54 PM EDT, June 20, 2025 = 19:54 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 54, tzinfo=dt.timezone.utc)
+# Current date and time: 04:34 PM EDT, June 20, 2025 = 20:34 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 20:34:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -46,7 +45,7 @@ except Exception as e:
 
 # --- Utility Functions ---
 
-## Login Functions
+# Login Functions
 @st.cache_data(ttl=3600)
 def load_credentials():
     try:
@@ -66,29 +65,35 @@ def load_credentials():
         return {}
 
 def login():
-    if "logged_in" not in st.session_state: st.session_state.logged_in = False
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
     if not st.session_state.logged_in:
         st.title("Please Log In")
         creds = load_credentials()
-        if not creds: st.stop()
+        if not creds:
+            st.stop()
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         if st.button("Login"):
             if username in creds and creds[username] == password:
                 st.session_state.logged_in = True
                 st.rerun()
-            else: st.error("Invalid username or password")
+            else:
+                st.error("Invalid username or password")
         st.stop()
 
 def safe_get_in(keys, data_dict, default=None):
     current = data_dict
     for key in keys:
-        if isinstance(current, dict) and key in current: current = current[key]
-        elif isinstance(current, list) and isinstance(key, int) and 0 <= key < len(current): current = current[key]
-        else: return default
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        elif isinstance(current, list) and isinstance(key, int) and 0 <= key < len(current):
+            current = current[key]
+        else:
+            return default
     return current
 
-## Fetch and Filter Functions
+# Fetch and Filter Functions
 @st.cache_data(ttl=600)
 def fetch_instruments():
     try:
@@ -114,7 +119,7 @@ def fetch_ticker(instr_name):
 def fetch_ticker_batch(instrument_names):
     ticker_data = {}
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced max_workers to 2 to limit concurrent requests
+        with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_instr = {executor.submit(fetch_ticker, instr): instr for instr in instrument_names}
             for future in as_completed(future_to_instr):
                 instr = future_to_instr[future]
@@ -140,8 +145,12 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['date_time'] = pd.to_datetime(dfc['ts'], unit='s', utc=True)
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
-    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC')
-    dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.replace(hour=8, errors='coerce')
+    # Ensure expiry_datetime_col is timezone-aware (UTC)
+    dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y", utc=True)
+    dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.floor('D') + pd.Timedelta(hours=8)
+    if dfc['expiry_datetime_col'].dt.tz is None:
+        logging.warning("expiry_datetime_col is naive after creation. Localizing to UTC.")
+        dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.tz_localize('UTC')
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
 @st.cache_data(ttl=600)
@@ -172,7 +181,9 @@ def fetch_kraken_data(coin="BTC", days=7):
         start = now - dt.timedelta(days=days)
         ohlcv = k.fetch_ohlcv(f"{coin}/USD", timeframe="5m", since=int(start.timestamp() * 1000))
         if ohlcv:
-            return pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]).assign(date_time=lambda x: pd.to_datetime(x["timestamp"], unit="ms", utc=True)).dropna(subset=['date_time']).sort_values("date_time").reset_index(drop=True)
+            return pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]).assign(
+                date_time=lambda x: pd.to_datetime(x["timestamp"], unit="ms", utc=True)
+            ).dropna(subset=['date_time']).sort_values("date_time").reset_index(drop=True)
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Error fetching Kraken data: {e}")
@@ -198,14 +209,21 @@ def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
         return []
-    expiry_dates = [pd.Timestamp(dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y").replace(tzinfo=dt.timezone.utc, hour=8)) for i in instruments if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']]
-    current_date_utc_ts = pd.Timestamp(current_date_utc)
+    expiry_dates = [
+        pd.Timestamp(dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y"), tz='UTC').replace(hour=8)
+        for i in instruments
+        if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']
+    ]
+    current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
     mask = [exp > current_date_utc_ts for exp in expiry_dates]
     return [exp for exp, m in zip(expiry_dates, mask) if m]
 
 @st.cache_data(ttl=600)
 def get_option_instruments(instruments, option_type, expiry_str, coin):
-    return np.array([i["instrument_name"] for i in instruments if i.get("instrument_name", "").startswith(f"{coin}-{expiry_str}") and i.get("instrument_name", "").endswith(f"-{option_type}")])
+    return np.array([
+        i["instrument_name"] for i in instruments
+        if i.get("instrument_name", "").startswith(f"{coin}-{expiry_str}") and i.get("instrument_name", "").endswith(f"-{option_type}")
+    ])
 
 # --- Greek Calculations (Vectorized) ---
 @st.cache_data(ttl=600)
@@ -213,9 +231,19 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc)
+    # Ensure snapshot_time_utc is a timezone-aware pd.Timestamp
+    snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc, tz='UTC')
+    
+    # Ensure expiry_datetime_col is timezone-aware (UTC)
+    df['expiry_datetime_col'] = pd.to_datetime(df['expiry_datetime_col'], utc=True, errors='coerce')
+    if df['expiry_datetime_col'].isna().any():
+        logging.warning("Some expiry_datetime_col values are NaT. Filling with snapshot_time_utc.")
+        df['expiry_datetime_col'] = df['expiry_datetime_col'].fillna(snapshot_time_utc_ts)
+    
+    # Calculate time to expiry (T) in years
     T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds().fillna(0) / (365 * 24 * 3600)
     T = np.where(T < 1e-9, 1e-9, T)
+    
     sigma = df['iv_close'].values
     k = df['k'].values
     S = np.full(len(df), spot_price) if np.isscalar(spot_price) else spot_price
@@ -228,9 +256,11 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     delta = np.where(option_type, norm.cdf(d1), norm.cdf(d1) - 1.0)
     gamma = norm.pdf(d1) / (S * sigma_sqrt_T)
     vega = S * norm.pdf(d1) * np.sqrt(T) * 0.01
-    theta = np.where(option_type,
-                     -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - risk_free_rate * k * np.exp(-risk_free_rate * T) * norm.cdf(d2),
-                     -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + risk_free_rate * k * np.exp(-risk_free_rate * T) * norm.cdf(-d2)) / 365.0
+    theta = np.where(
+        option_type,
+        -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - risk_free_rate * k * np.exp(-risk_free_rate * T) * norm.cdf(d2),
+        -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + risk_free_rate * k * np.exp(-risk_free_rate * T) * norm.cdf(-d2)
+    ) / 365.0
 
     return df.assign(delta=delta, gamma=gamma, vega=vega, theta=theta)
 
@@ -238,7 +268,7 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
 @st.cache_data(ttl=600)
 def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_time_utc, risk_free_rate=0.0):
     st.subheader("MM Indicative Delta-Gamma Hedge Adjustment (Selected Expiry)")
-    st.caption("Assumes Market Maker is short the entire displayed option book for this expiry. Shows theoretical adjustment using a near-ATM call, short puts, stETH, and inverse positions.")
+    st.caption("Assumes Market Maker is short the entire displayed option book for this expiry.")
 
     if dft_latest_snap.empty or not all(c in dft_latest_snap.columns for c in ['instrument_name', 'k', 'option_type', 'iv_close', 'open_interest', 'expiry_datetime_col']):
         st.warning("Cannot perform analysis: Latest snapshot data missing required columns or empty.")
@@ -276,7 +306,7 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
     puts_in_book = df_book[df_book['option_type'] == 'P']
     if not puts_in_book.empty:
         puts_in_book['moneyness_dist'] = np.abs(puts_in_book['k'] - spot_price)
-        atm_put_idx = np.argmin(puts_in_book[puts_in_book['k'] <= spot_price]['moneyness_dist'])
+        atm_put_idx = np.argmin(puts_in_book[puts_in_book['k'] <= spot_price]['moneyness_dist']) if not puts_in_book[puts_in_book['k'] <= spot_price].empty else np.argmin(puts_in_book['moneyness_dist'])
         theta_hedger_selected = puts_in_book.iloc[atm_put_idx]
 
     if gamma_hedger_selected is None and theta_hedger_selected is None:
@@ -296,7 +326,6 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
     put_theta = theta_hedger_selected['theta'] if theta_hedger_selected is not None else 0.0
 
     total_delta_from_extras = np.sum([steth_position * steth_delta, inverse_position * inverse_delta, short_put_position * put_delta])
-    total_gamma_from_extras = 0.0
     total_theta_from_extras = short_put_position * put_theta
 
     N_h = -mm_net_gamma_initial / gamma_hedger_selected['gamma'] if gamma_hedger_selected is not None and abs(gamma_hedger_selected['gamma']) > 1e-7 else 0.0
@@ -312,10 +341,14 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
 
     st.markdown("#### Indicative Gamma & Theta Hedge Adjustments:")
     cols_hedge = st.columns(4)
-    with cols_hedge[0]: st.metric("Gamma Hedger Delta (Dₕ)", f"{gamma_hedger_selected['delta']:.4f}" if gamma_hedger_selected is not None else "N/A")
-    with cols_hedge[1]: st.metric("Gamma Hedger Gamma (Gₕ)", f"{gamma_hedger_selected['gamma']:.6f}" if gamma_hedger_selected is not None else "N/A")
-    with cols_hedge[2]: st.metric(f"Gamma Hedge Qty ({'Buy' if N_h > 0 else 'Sell'})", f"{abs(N_h):,.2f} units" if gamma_hedger_selected is not None else "N/A")
-    with cols_hedge[3]: st.metric("Put Delta (Dₚ)", f"{put_delta:.4f}" if theta_hedger_selected is not None else "N/A")
+    with cols_hedge[0]:
+        st.metric("Gamma Hedger Delta (Dₕ)", f"{gamma_hedger_selected['delta']:.4f}" if gamma_hedger_selected is not None else "N/A")
+    with cols_hedge[1]:
+        st.metric("Gamma Hedger Gamma (Gₕ)", f"{gamma_hedger_selected['gamma']:.6f}" if gamma_hedger_selected is not None else "N/A")
+    with cols_hedge[2]:
+        st.metric(f"Gamma Hedge Qty ({'Buy' if N_h > 0 else 'Sell'})", f"{abs(N_h):,.2f} units" if gamma_hedger_selected is not None else "N/A")
+    with cols_hedge[3]:
+        st.metric("Put Delta (Dₚ)", f"{put_delta:.4f}" if theta_hedger_selected is not None else "N/A")
 
     st.metric("Delta Change from Gamma Hedge", f"{delta_from_gamma_hedge:,.2f}")
     st.metric("Delta Change from Theta Hedge", f"{delta_from_theta_hedge:,.2f}")
@@ -331,9 +364,9 @@ def display_mm_gamma_adjustment_analysis(dft_latest_snap, spot_price, snapshot_t
 
     final_net_delta_book = mm_net_delta_post_gamma_hedge + underlying_hedge_qty
     st.success(f"**Resulting Book Net Delta (Post-All Adjustments):** {final_net_delta_book:,.4f} (should be ~0)")
-    st.caption("This indicates the spot/perp hedge needed for the MM to become delta-neutral after neutralizing gamma and theta with the chosen options and extras.")
+    st.caption("This indicates the spot/perp hedge needed for the MM to become delta-neutral.")
 
-# --- Plotting Functions (Optimized) ---
+# --- Plotting Functions (Simplified) ---
 @st.cache_data(ttl=300)
 def plot_delta_balance(ticker_list, spot_price):
     if not ticker_list or pd.isna(spot_price):
@@ -354,94 +387,48 @@ def plot_open_interest_delta(ticker_list, spot_price):
         return
     df = pd.DataFrame(ticker_list).dropna(subset=['strike', 'open_interest', 'delta', 'iv'])
     df['moneyness'] = df['strike'] / spot_price
-    fig = px.scatter(df, x="strike", y="delta", size="open_interest", color="moneyness", color_continuous_scale=px.colors.diverging.RdYlBu_r, range_color=[0.8, 1.2], hover_data=["instrument", "open_interest", "iv"], size_max=50)
+    fig = px.scatter(
+        df, x="strike", y="delta", size="open_interest", color="moneyness",
+        color_continuous_scale=px.colors.diverging.RdYlBu_r, range_color=[0.8, 1.2],
+        hover_data=["instrument", "open_interest", "iv"], size_max=50
+    )
     fig.add_vline(x=spot_price, line_dash="dot", line_color="black")
     fig.add_hline(y=0.5, line_dash="dot", line_color="grey")
     fig.add_hline(y=-0.5, line_dash="dot", line_color="grey")
     st.plotly_chart(fig, use_container_width=True)
 
-@st.cache_data(ttl=300)
+# Placeholder for undefined plotting functions
 def plot_intraday_premium_spikes(df_options_hist, df_spot_hist, coin_symbol, spot_price_latest, selected_expiry_str):
     st.subheader(f"Intraday Premium Spikes ({coin_symbol} - {selected_expiry_str})")
-    if df_options_hist.empty:
-        st.info("Premium Spikes: Historical option data is empty.")
-        return
-    df_filtered = df_options_hist[df_options_hist['k'] < df_options_hist['spot_hist']].copy()
-    df_calls = df_filtered[df_filtered['option_type'] == 'C'].copy()
-    df_puts = df_filtered[df_filtered['option_type'] == 'P'].copy()
-    df_calls['pct_change'] = df_calls.groupby('instrument_name')['mark_price_close'].pct_change().fillna(0) * 100
-    df_puts['pct_change'] = df_puts.groupby('instrument_name')['mark_price_close'].pct_change().fillna(0) * 100
-    max_call_spike = np.max(np.abs(df_calls['pct_change'])) if not df_calls.empty else 0.0
-    max_put_spike = np.max(np.abs(df_puts['pct_change'])) if not df_puts.empty else 0.0
-    max_call_ts = df_calls.loc[df_calls['pct_change'].abs().idxmax(), 'date_time'] if not df_calls.empty else None
-    max_put_ts = df_puts.loc[df_puts['pct_change'].abs().idxmax(), 'date_time'] if not df_puts.empty else None
-    st.session_state['max_spike_call_pct'] = max_call_spike
-    st.session_state['max_spike_call_date'] = max_call_ts.date() if max_call_ts else None
-    st.session_state['max_spike_put_pct'] = max_put_spike
-    st.session_state['max_spike_put_date'] = max_put_ts.date() if max_put_ts else None
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
-    if not df_calls.empty: fig.add_trace(go.Scatter(x=df_calls['date_time'], y=df_calls['pct_change'], mode='lines'), row=1, col=1)
-    if not df_puts.empty: fig.add_trace(go.Scatter(x=df_puts['date_time'], y=df_puts['pct_change'], mode='lines'), row=2, col=1)
-    fig.update_layout(height=600)
-    st.plotly_chart(fig)
+    st.info("Premium Spikes plot not implemented due to missing function definition.")
 
-@st.cache_data(ttl=300)
 def compute_and_plot_itm_gex_ratio(dft, df_krak_5m, spot_price_latest, selected_expiry_obj):
     st.subheader(f"ITM Put/Call GEX Ratio (Expiry: {selected_expiry_obj.strftime('%d%b%y')})")
-    if dft.empty or df_krak_5m.empty:
-        st.info("GEX Ratio: Data insufficient.")
-        return pd.DataFrame()
-    df_merged_gex = pd.merge_asof(dft.sort_values('date_time'), df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_price'}), on='date_time', direction='nearest', tolerance=pd.Timedelta('15min')).dropna(subset=['spot_price'])
-    df_merged_gex['gamma'] = compute_greeks_vectorized(df_merged_gex, df_merged_gex['spot_price'].values, df_merged_gex['date_time'].values)['gamma'].values
-    df_merged_gex['gex'] = df_merged_gex['gamma'] * df_merged_gex['open_interest'] * (df_merged_gex['spot_price'] ** 2) * 0.01
-    df_merged_gex['is_itm_call'] = (df_merged_gex['option_type'] == 'C') & (df_merged_gex['k'] < df_merged_gex['spot_price'])
-    df_merged_gex['is_itm_put'] = (df_merged_gex['option_type'] == 'P') & (df_merged_gex['k'] > df_merged_gex['spot_price'])
-    df_agg = df_merged_gex.groupby('date_time').agg({'gex': ['sum', lambda x: np.sum(x[df_merged_gex['is_itm_call']]), lambda x: np.sum(x[df_merged_gex['is_itm_put']])]}).reset_index()
-    df_agg.columns = ['date_time', 'total_gex', 'total_itm_call_gex', 'total_itm_put_gex']
-    df_agg['itm_gex_ratio'] = df_agg['total_itm_put_gex'] / (df_agg['total_itm_call_gex'] + 1e-9)
-    df_plot_final = pd.merge_asof(df_agg.sort_values('date_time'), df_krak_5m[['date_time', 'close']], on='date_time', direction='nearest', tolerance=pd.Timedelta('5min')).dropna()
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=df_plot_final['date_time'], y=df_plot_final['itm_gex_ratio'], name='ITM P/C GEX Ratio'), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_plot_final['date_time'], y=df_plot_final['close'], name=f'{coin_symbol} Spot Price'), secondary_y=True)
-    fig.update_layout(title=f"{coin_symbol} Intraday - Spot: ${spot_price_latest:,.2f}, ITM P/C GEX Ratio", height=500)
-    st.plotly_chart(fig)
-    st.metric("Latest ITM P/C GEX Ratio", f"{df_plot_final['itm_gex_ratio'].iloc[-1]:.2f}")
-    return df_plot_final
-
-@st.cache_data(ttl=300)
-def plot_matrix_hedge_thalex(portfolio_state_df, hedge_actions_df, symbol):
-    st.subheader(f"Matrix Delta Hedging Simulation ({symbol} - MM Short Book)")
-    if portfolio_state_df.empty:
-        st.info("No data for Matrix Delta Hedging plot.")
-        return
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": True}]], subplot_titles=("Net Portfolio Delta & Components", f"Hedge Position ({symbol}) & Spot Price", "Cumulative P&L and Costs"))
-    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['net_delta_final'], name='Net Portfolio Delta'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['current_n1'], name='Underlying Hedge Qty'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['spot_price'], name='Spot Price'), row=2, col=1, secondary_y=True)
-    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['cumulative_pnl'], name='Cumulative P&L'), row=3, col=1)
-    fig.add_trace(go.Scatter(x=portfolio_state_df['timestamp'], y=portfolio_state_df['cumulative_trading_costs'], name='Cumulative Costs'), row=3, col=1, secondary_y=True)
-    fig.update_layout(height=800)
-    st.plotly_chart(fig)
+    st.info("GEX Ratio plot not implemented due to missing function definition.")
+    return pd.DataFrame()
 
 # --- Main Function ---
 def main():
     st.set_page_config(layout="wide", page_title="Advanced Options Hedging & MM Dashboard")
     login()
 
-    # Ensure selected_coin is a string
+    # Initialize session state
     if 'selected_coin' not in st.session_state:
         st.session_state.selected_coin = "BTC"
     elif not isinstance(st.session_state.selected_coin, str):
         st.session_state.selected_coin = str(st.session_state.selected_coin)
-
-    if 'snapshot_time' not in st.session_state: st.session_state.snapshot_time = CURRENT_TIME_UTC
-    if 'risk_free_rate_input' not in st.session_state: st.session_state.risk_free_rate_input = 0.01
+    if 'snapshot_time' not in st.session_state:
+        st.session_state.snapshot_time = pd.Timestamp(CURRENT_TIME_UTC, tz='UTC')
+    if 'risk_free_rate_input' not in st.session_state:
+        st.session_state.risk_free_rate_input = 0.01
 
     st.title(f"{st.session_state.selected_coin} Options: Advanced Hedging & MM Perspective")
-    if st.sidebar.button("Logout"): st.session_state.logged_in = False; st.rerun()
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.rerun()
 
     st.sidebar.header("Configuration")
-    coin_options = ["BTC", "ETH"]  # List of strings
+    coin_options = ["BTC", "ETH"]
     current_coin_idx = coin_options.index(st.session_state.selected_coin) if st.session_state.selected_coin in coin_options else 0
     selected_coin_widget = st.sidebar.selectbox("Cryptocurrency", coin_options, index=current_coin_idx, key="main_coin_select_adv_vFull2_final")
     if selected_coin_widget != st.session_state.selected_coin:
@@ -449,9 +436,11 @@ def main():
         st.rerun()
     coin = st.session_state.selected_coin
 
-    st.session_state.risk_free_rate_input = st.sidebar.number_input("Risk-Free Rate (Annualized)", value=st.session_state.risk_free_rate_input, min_value=0.0, max_value=0.2, step=0.001, format="%.3f", key="main_rf_rate_adv_vFull2_final")
+    st.session_state.risk_free_rate_input = st.sidebar.number_input(
+        "Risk-Free Rate (Annualized)", value=st.session_state.risk_free_rate_input, min_value=0.0, max_value=0.2, step=0.001, format="%.3f", key="main_rf_rate_adv_vFull2_final"
+    )
     risk_free_rate = st.session_state.risk_free_rate_input
-    st.session_state.snapshot_time = CURRENT_TIME_UTC
+    st.session_state.snapshot_time = pd.Timestamp(CURRENT_TIME_UTC, tz='UTC')
 
     pair_sim_lookback_days = st.sidebar.number_input("Hist. Lookback (days)", min_value=7, max_value=365, value=30, step=7, key="pair_sim_lookback_days_adv_vFull2_final")
     spot_merge_tolerance_minutes = st.sidebar.number_input("Spot Merge Tolerance (minutes)", min_value=1, max_value=240, value=15, step=1, key="spot_merge_tolerance_adv_vFull2_final")
@@ -460,23 +449,41 @@ def main():
     spot_price = df_krak_5m["close"].iloc[-1] if not df_krak_5m.empty else np.nan
 
     all_instruments_list = fetch_instruments()
-    if not all_instruments_list: st.error("Failed to fetch instruments list."); st.stop()
+    if not all_instruments_list:
+        st.error("Failed to fetch instruments list.")
+        st.stop()
 
     current_snapshot_time = st.session_state.snapshot_time
     valid_expiries = get_valid_expiration_options(current_snapshot_time)
     if not valid_expiries:
-        st.error(f"No valid expiries for {coin}."); st.stop()
+        st.error(f"No valid expiries for {coin}.")
+        st.stop()
 
     default_exp_idx = 0
     if valid_expiries:
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_expiry = {executor.submit(lambda x: (x, np.sum([fetch_ticker(instr).get('open_interest', 0) for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] + get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]])), exp): exp for exp in valid_expiries}
+            future_to_expiry = {
+                executor.submit(
+                    lambda x: (
+                        x,
+                        np.sum([
+                            fetch_ticker(instr).get('open_interest', 0)
+                            for instr in get_option_instruments(all_instruments_list, "C", x.strftime("%d%b%y").upper(), coin)[:50] +
+                            get_option_instruments(all_instruments_list, "P", x.strftime("%d%b%y").upper(), coin)[:50]
+                        ])
+                    ),
+                    exp
+                ): exp for exp in valid_expiries
+            }
             expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
         if expiry_oi_map:
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-            default_exp_idx = int(valid_expiries.index(best_expiry_by_oi))  # Use list.index() for consistency
+            default_exp_idx = valid_expiries.index(best_expiry_by_oi)
 
-    selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
+    selected_expiry = st.sidebar.selectbox(
+        "Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"),
+        key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default"
+    )
     e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
     all_calls_expiry = get_option_instruments(all_instruments_list, "C", e_str, coin)
     all_puts_expiry = get_option_instruments(all_instruments_list, "P", e_str, coin)
@@ -485,7 +492,9 @@ def main():
     st.header(f"Analysis: {coin} | Expiry: {e_str} | Spot: ${spot_price:,.2f}" if not np.isnan(spot_price) else f"Analysis: {coin} | Expiry: {e_str} | Spot: N/A")
     st.markdown(f"*Snapshot: {st.session_state.snapshot_time.strftime('%Y-%m-%d %H:%M:%S UTC')} | RF Rate: {risk_free_rate:.3%}*")
 
-    if not all_instr_selected_expiry.size: st.error(f"No options for {e_str}."); st.stop()
+    if not all_instr_selected_expiry.size:
+        st.error(f"No options for {e_str}.")
+        st.stop()
     dft_raw = fetch_data(all_instr_selected_expiry, historical_lookback_days=pair_sim_lookback_days)
     ticker_data = fetch_ticker_batch(all_instr_selected_expiry)
     valid_tickers = np.array([k for k, v in ticker_data.items() if v and isinstance(v.get('iv'), (int, float)) and v.get('iv', 0) > 1e-4 and pd.notna(v.get('open_interest'))])
@@ -496,10 +505,16 @@ def main():
 
     dft_with_hist_greeks = pd.DataFrame()
     if not dft.empty and not df_krak_5m.empty:
-        merged_hist = pd.merge_asof(dft.sort_values('date_time'), df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}), on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)).dropna(subset=['spot_hist'])
+        merged_hist = pd.merge_asof(
+            dft.sort_values('date_time'),
+            df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}),
+            on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)
+        ).dropna(subset=['spot_hist'])
         if not merged_hist.empty:
             with st.spinner("Calculating Greeks (Delta, Gamma, Vega, Theta) on historical data..."):
-                dft_with_hist_greeks = compute_greeks_vectorized(merged_hist, merged_hist['spot_hist'].values, merged_hist['date_time'].values, risk_free_rate)
+                dft_with_hist_greeks = compute_greeks_vectorized(
+                    merged_hist, merged_hist['spot_hist'].values, merged_hist['date_time'].values, risk_free_rate
+                )
 
     dft_latest = pd.DataFrame()
     if not dft.empty and not np.isnan(spot_price):
@@ -510,56 +525,25 @@ def main():
             dft_latest = compute_greeks_vectorized(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
 
     def safe_plot_exec(plot_func, *args, **kwargs):
-        try: plot_func(*args, **kwargs)
-        except Exception as e: st.error(f"Plot error in {plot_func.__name__}: {e}"); logging.error(f"Plot error in {plot_func.__name__}", exc_info=True)
+        try:
+            plot_func(*args, **kwargs)
+        except Exception as e:
+            st.error(f"Plot error in {plot_func.__name__}: {e}")
+            logging.error(f"Plot error in {plot_func.__name__}", exc_info=True)
 
     if not dft_latest.empty:
-        ticker_list_latest_snap = np.array([{'instrument': row['instrument_name'], 'strike': int(row['k']), 'option_type': row['option_type'], 'open_interest': float(row['open_interest']), 'delta': float(row['delta']), 'gamma': float(row['gamma']), 'iv': float(row['iv_close'])} for _, row in dft_latest.iterrows()])
+        ticker_list_latest_snap = np.array([
+            {
+                'instrument': row['instrument_name'], 'strike': int(row['k']), 'option_type': row['option_type'],
+                'open_interest': float(row['open_interest']), 'delta': float(row['delta']),
+                'gamma': float(row['gamma']), 'iv': float(row['iv_close'])
+            } for _, row in dft_latest.iterrows()
+        ])
         if ticker_list_latest_snap.size:
             safe_plot_exec(plot_open_interest_delta, ticker_list_latest_snap, spot_price)
             safe_plot_exec(plot_delta_balance, ticker_list_latest_snap, spot_price)
 
-    st.markdown("---"); st.header("1. Standard Delta Hedging Simulations")
-    show_std_dh_sims = st.sidebar.checkbox("Show Standard Delta Hedging Simulations", True, key="adv_show_std_dh_sims_vFull2_final")
-    if show_std_dh_sims:
-        if not dft_with_hist_greeks.empty and not df_krak_5m.empty and not np.isnan(spot_price):
-            tc_bps_val_sidebar = st.sidebar.number_input("Transaction Cost (bps) for Sims", 0, 10, TRANSACTION_COST_BPS, 1, key="adv_tc_bps_val_sidebar_vFull2_final")
-            use_dyn_thresh_sidebar = st.sidebar.checkbox("Use Dynamic Threshold for Sims", True, key="adv_dh_dyn_thr_val_sidebar_vFull2_final")
-            try:
-                with Pool(processes=4) as pool:
-                    hedge_instance_std = HedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, use_dynamic_threshold=use_dyn_thresh_sidebar, transaction_cost_bps=tc_bps_val_sidebar)
-                    delta_df_std, hedge_actions_std = pool.starmap(hedge_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
-                if not delta_df_std.empty:
-                    plot_delta_hedging_thalex(delta_df_std, hedge_actions_std, hedge_instance_std.base_threshold, use_dyn_thresh_sidebar, coin, spot_price, df_krak_5m)
-                with Pool(processes=4) as pool:
-                    matrix_instance_std = MatrixHedgeThalex(dft_with_hist_greeks, df_krak_5m, coin, transaction_cost_bps=tc_bps_val_sidebar)
-                    state_df_mat_std, actions_df_mat_std = pool.starmap(matrix_instance_std.run_loop, [(min(7, pair_sim_lookback_days),)])
-                if not state_df_mat_std.empty:
-                    plot_matrix_hedge_thalex(state_df_mat_std, actions_df_mat_std, coin)
-                if sel_call_pair and sel_put_pair:
-                    plot_net_delta_otm_pair(dft_with_hist_greeks, df_krak_5m, exchange1, sel_call_pair, sel_put_pair, all_calls_expiry, all_puts_expiry)
-            except Exception as e:
-                st.warning(f"Error in Standard Delta Hedging Simulations: {e}")
-                logging.error(f"Error in Standard Delta Hedging Simulations: {e}", exc_info=True)
-        else:
-            st.warning("Standard Delta Hedging Sims: Data insufficient.")
-
-    st.markdown("---"); st.header("Delta Hedging M2M Dashboard (Dark Theme)")
-    if st.sidebar.checkbox("Show Delta Hedging M2M Dashboard (Dark Style)", True, key="adv_show_dh_m2m_dark_dashboard_main_vFull3_final"):
-        if 'delta_df_std' in locals() and not delta_df_std.empty and not np.isnan(spot_price):
-            plot_hedging_summary_dashboard_dark_style(delta_df_std, hedge_actions_std, hedge_instance_std.base_threshold, use_dyn_thresh_sidebar, coin, spot_price)
-        else:
-            st.info("Dark Dashboard: Data from 'Standard Delta Hedging Simulations' is not available.")
-
-    st.markdown("---"); st.header(f"4. Intraday Premium Spikes Analysis (Expiry: {e_str})")
-    if not dft_with_hist_greeks.empty and not df_krak_5m.empty and not np.isnan(spot_price) and e_str:
-        plot_intraday_premium_spikes(dft_with_hist_greeks, df_krak_5m, coin, spot_price, e_str)
-
-    st.markdown("---"); st.header(f"2. ITM Gamma Exposure Analysis (Expiry: {e_str})")
-    if not dft_with_hist_greeks.empty and not df_krak_5m.empty and not np.isnan(spot_price) and selected_expiry:
-        compute_and_plot_itm_gex_ratio(dft_with_hist_greeks, df_krak_5m, spot_price, selected_expiry)
-
-    st.markdown("---"); st.header("3. Market Maker Perspective")
+    st.markdown("---"); st.header("Market Maker Perspective")
     if not dft_latest.empty:
         st.subheader("Net Greek Exposures (Latest Snapshot - MM Short Book)")
         cols_greeks_adv = st.columns(5)
@@ -573,77 +557,13 @@ def main():
         cols_greeks_adv[3].metric("Net Theta", f"{net_t_mm:,.2f}")
         display_mm_gamma_adjustment_analysis(dft_latest, spot_price, st.session_state.snapshot_time, risk_free_rate)
 
-    st.markdown("---"); st.header("Intraday Option Flow Indicators (Last 500 Mins)")
-    if not dft_with_hist_greeks.empty:
-        current_time = dft_with_hist_greeks['date_time'].max()
-        df_recent_options = dft_with_hist_greeks[dft_with_hist_greeks['date_time'] > (current_time - pd.Timedelta(minutes=500))].copy()
-        if 'pct_change_N_min' not in df_recent_options.columns and not df_recent_options.empty:
-            df_recent_options['pct_change_N_min'] = df_recent_options.groupby('instrument_name')['mark_price_close'].pct_change().fillna(0) * 100
-        if not df_recent_options.empty and not np.isnan(spot_price):
-            spike_activity_results = calculate_aggregated_spike_activity(df_recent_options, spot_price, spike_threshold_pct=1.0, time_window_minutes=30)
-            st.text(spike_activity_results['summary_string'])
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Spikes (1%)", spike_activity_results['total_spikes'])
-            col2.metric("Call Spike Ratio", f"{spike_activity_results['call_spike_ratio']:.0%}")
-            col3.metric("OTM Call Spikes", str(spike_activity_results['otm_call_spikes']))
-
-    st.markdown("---"); st.subheader("Option Beta & Flow Residuals (Selected Strikes - Historical Window)")
-    if not dft_with_hist_greeks.empty and not df_spot_hist.empty:
-        example_instruments = dft_latest.nlargest(3, 'open_interest')['instrument_name'].values if not dft_latest.empty else dft_with_hist_greeks['instrument_name'].unique()[:3]
-        for instr_name in example_instruments:
-            df_instr_hist_full = dft_with_hist_greeks[dft_with_hist_greeks['instrument_name'] == instr_name].copy()
-            df_beta_data = pd.merge_asof(df_instr_hist_full[['date_time', 'mark_price_close', 'delta']].sort_values('date_time'), df_spot_hist[['date_time', 'close']].sort_values('date_time'), on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=10)).dropna()
-            if len(df_beta_data) > 12:
-                beta_ts = calculate_option_beta(df_beta_data['mark_price_close'].values, df_beta_data['close'].values, rolling_window=12)
-                if not beta_ts.empty:
-                    latest_beta = beta_ts.iloc[-1]
-                    latest_delta = df_beta_data['delta'].iloc[-1]
-                    cols_beta = st.columns(2)
-                    cols_beta[0].metric(f"Latest Beta (1hr roll)", f"{latest_beta:.2f}")
-                    cols_beta[1].metric(f"Theoretical Delta", f"{latest_delta:.2f}")
-                    if abs(latest_beta - latest_delta) > 0.1:
-                        cols_beta[0].warning(f"Beta deviates significantly! Suggests pressure.")
-            df_flow_input = pd.merge_asof(df_instr_hist_full.sort_values('date_time'), df_spot_hist[['date_time', 'close']].rename(columns={'close': 'spot_hist'}).sort_values('date_time'), on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=10)).dropna()
-            if len(df_flow_input) > 20:
-                flow_residual, spot_adjusted_flow = calculate_flow_residual(df_flow_input)
-                if np.any(~np.isnan(spot_adjusted_flow)):
-                    fig_spot_adj_flow = go.Figure()
-                    fig_spot_adj_flow.add_trace(go.Scatter(x=df_flow_input['date_time'].iloc[1:].values, y=np.cumsum(spot_adjusted_flow.iloc[1:].values), mode='lines'))
-                    fig_spot_adj_flow.update_layout(title=f"Cumulative Spot-Adjusted Flow for {instr_name}", height=250)
-                    st.plotly_chart(fig_spot_adj_flow)
-
-    st.markdown("---"); st.header("NEW: Aggregated Intraday Premium Activity")
-    agg_method = st.sidebar.selectbox("Premium Aggregation Method", ['mean', 'sum'], index=0)
-    rolling_window_agg = st.sidebar.slider("Rolling Window for StdDev (periods)", 5, 60, 20, 5)
-    std_dev_agg = st.sidebar.number_input("StdDev Threshold for Spikes", 1.0, 5.0, 2.0, 0.1)
-    if not dft_with_hist_greeks.empty and not df_spot_hist.empty:
-        plot_aggregated_intraday_premium_activity(dft_with_hist_greeks, df_spot_hist, coin, e_str, rolling_window_agg, std_dev_agg, agg_method)
-
-    st.markdown("---"); st.header(f"5. Daily OI Spikes vs Premium Spikes Analysis (Expiry: {e_str})")
-    retrieved_premium_spike_data = {'max_spike_call_pct': st.session_state.get('max_spike_call_pct', 0.0), 'max_spike_call_date': st.session_state.get('max_spike_call_date', None), 'max_spike_put_pct': st.session_state.get('max_spike_put_pct', 0.0), 'max_spike_put_date': st.session_state.get('max_spike_put_date', None)}
-    if not dft_with_hist_greeks.empty and not np.isnan(spot_price) and e_str:
-        plot_daily_oi_and_premium_spike_summary(dft_with_hist_greeks, coin, spot_price, e_str, retrieved_premium_spike_data)
-
-    st.markdown("---")
-    if st.sidebar.checkbox("Show MM D-G Hedge Sim Plot", value=True):
-        st.header("MM Delta-Gamma Hedging Simulation (Historical)")
-        if not dft_with_hist_greeks.empty and not df_krak_5m.empty and selected_expiry and not dft_latest.empty:
-            gamma_hedger_candidate_df = dft_latest[(dft_latest['option_type'] == 'C') & (dft_latest['k'] >= spot_price)].sort_values('k')
-            if gamma_hedger_candidate_df.empty and not dft_latest[dft_latest['option_type'] == 'C'].empty:
-                gamma_hedger_candidate_df = dft_latest[dft_latest['option_type'] == 'C'].iloc[[np.argmin(np.abs(dft_latest[dft_latest['option_type'] == 'C']['k'] - spot_price))]]
-            if not gamma_hedger_candidate_df.empty:
-                gamma_hedger_row_sim = gamma_hedger_candidate_df.iloc[0]
-                gamma_hedger_details_sim = {'name': gamma_hedger_row_sim['instrument_name'], 'k': gamma_hedger_row_sim['k'], 'option_type': gamma_hedger_row_sim['option_type'], 'expiry_datetime_col': gamma_hedger_row_sim['expiry_datetime_col']}
-                with Pool(processes=4) as pool:
-                    mm_dg_sim_instance = MatrixDeltaGammaHedgeSimple(dft_with_hist_greeks, df_krak_5m, coin, risk_free_rate, gamma_hedger_details_sim)
-                    mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim = pool.starmap(mm_dg_sim_instance.run_loop, [(min(5, pair_sim_lookback_days),)])
-                if not mm_dg_portfolio_state_df_sim.empty:
-                    plot_mm_delta_gamma_hedge(mm_dg_portfolio_state_df_sim, mm_dg_hedge_actions_df_sim, coin)
-
     st.markdown("---"); st.header("Raw Data Tables (Debug)")
-    with st.expander("dft_raw (Initial Fetch - Head)"): st.dataframe(dft_raw.head(20))
-    with st.expander("dft (After Current Ticker Filter - Head)"): st.dataframe(dft.head(20))
-    with st.expander("dft_with_hist_greeks (For Sims - Head)"): st.dataframe(dft_with_hist_greeks.head(20))
+    with st.expander("dft_raw (Initial Fetch - Head)"):
+        st.dataframe(dft_raw.head(20))
+    with st.expander("dft (After Current Ticker Filter - Head)"):
+        st.dataframe(dft.head(20))
+    with st.expander("dft_with_hist_greeks (For Sims - Head)"):
+        st.dataframe(dft_with_hist_greeks.head(20))
 
     gc.collect()
     logging.info(f"--- ADVANCED Dashboard rendering complete for {coin} {e_str} ---")
