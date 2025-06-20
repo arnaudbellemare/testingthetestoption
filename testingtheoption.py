@@ -29,8 +29,8 @@ COLUMNS = ["ts", "mark_price_open", "mark_price_high", "mark_price_low", "mark_p
 REQUEST_TIMEOUT = 15
 TRANSACTION_COST_BPS = 2
 
-# Current date and time: 03:38 PM EDT, June 20, 2025 = 19:38 UTC
-CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 38, tzinfo=dt.timezone.utc)
+# Current date and time: 03:45 PM EDT, June 20, 2025 = 19:45 UTC
+CURRENT_TIME_UTC = dt.datetime(2025, 6, 20, 19, 45, tzinfo=dt.timezone.utc)
 
 # Initialize exchange
 exchange1 = None
@@ -137,8 +137,8 @@ def fetch_data(instruments_tuple, historical_lookback_days=7):
     dfc['k'] = dfc['instrument_name'].str.split('-').str[2].astype(float)
     dfc['option_type'] = dfc['instrument_name'].str.split('-').str[-1]
     dfc['expiry_datetime_col'] = pd.to_datetime(dfc['instrument_name'].str.split('-').str[1], format="%d%b%y").dt.tz_localize('UTC')
-    # Apply replace to set hour to 8 using apply with a lambda function
-    dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].apply(lambda x: x.replace(hour=8) if pd.notna(x) else x)
+    # Use vectorized dt.replace to set hour to 8, preserving timezone
+    dfc['expiry_datetime_col'] = dfc['expiry_datetime_col'].dt.replace(hour=8, errors='coerce')
     return dfc.dropna(subset=['k', 'option_type', 'mark_price_close', 'iv_close', 'expiry_datetime_col', 'date_time']).sort_values('date_time')
 
 @st.cache_data(ttl=600)
@@ -212,9 +212,10 @@ def compute_greeks_vectorized(df, spot_price, snapshot_time_utc, risk_free_rate=
     if df.empty or 'k' not in df.columns or 'iv_close' not in df.columns or 'option_type' not in df.columns or 'expiry_datetime_col' not in df.columns:
         return df.assign(delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan)
     
-    # Use existing expiry_datetime_col directly, convert snapshot_time_utc to Timestamp
+    # Ensure snapshot_time_utc is a Timestamp and handle NaT values
     snapshot_time_utc_ts = pd.Timestamp(snapshot_time_utc)
-    T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds() / (365 * 24 * 3600)
+    # Subtract and handle potential NaT values with fillna
+    T = (df['expiry_datetime_col'] - snapshot_time_utc_ts).dt.total_seconds().fillna(0) / (365 * 24 * 3600)
     T = np.where(T < 1e-9, 1e-9, T)
     sigma = df['iv_close'].values
     k = df['k'].values
@@ -474,7 +475,7 @@ def main():
             expiry_oi_map = {future.result()[0]: future.result()[1] for future in as_completed(future_to_expiry)}
         if expiry_oi_map:
             best_expiry_by_oi = max(expiry_oi_map.items(), key=lambda x: x[1])[0]
-            default_exp_idx = int(valid_expiries.index(best_expiry_by_oi))  # Use list.index() instead of np.where for consistency
+            default_exp_idx = int(valid_expiries.index(best_expiry_by_oi))  # Use list.index() for consistency
 
     selected_expiry = st.sidebar.selectbox("Choose Expiry", valid_expiries, index=default_exp_idx, format_func=lambda d: d.strftime("%d %b %Y"), key=f"main_expiry_select_adv_vFull2_final_{coin}_oi_default")
     e_str = selected_expiry.strftime("%d%b%y").upper() if selected_expiry else "N/A"
@@ -496,8 +497,7 @@ def main():
 
     dft_with_hist_greeks = pd.DataFrame()
     if not dft.empty and not df_krak_5m.empty:
-        dft['date_time'] = pd.to_datetime(dft['date_time'])
-        df_krak_5m['date_time'] = pd.to_datetime(df_krak_5m['date_time'])
+        # Ensure date_time columns are already timezone-aware, no need for re-conversion
         merged_hist = pd.merge_asof(dft.sort_values('date_time'), df_krak_5m[['date_time', 'close']].rename(columns={'close': 'spot_hist'}), on='date_time', direction='nearest', tolerance=pd.Timedelta(minutes=spot_merge_tolerance_minutes)).dropna(subset=['spot_hist'])
         if not merged_hist.empty:
             with st.spinner("Calculating Greeks (Delta, Gamma, Vega, Theta) on historical data..."):
