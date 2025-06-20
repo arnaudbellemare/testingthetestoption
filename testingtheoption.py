@@ -31,8 +31,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 04:34 PM EDT, June 20, 2025 = 20:34 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 20:34:00", tz="UTC")
+# Current date and time: 04:55 PM EDT, June 20, 2025 = 20:55 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 20:55:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -209,8 +209,9 @@ def get_valid_expiration_options(current_date_utc):
     instruments = fetch_instruments()
     if not instruments:
         return []
+    # Ensure all timestamps are UTC-aware
     expiry_dates = [
-        pd.Timestamp(dt.datetime.strptime(i.get("instrument_name", "").split("-")[1], "%d%b%y"), tz='UTC').replace(hour=8)
+        pd.to_datetime(i.get("instrument_name", "").split("-")[1], format="%d%b%y", utc=True).replace(hour=8)
         for i in instruments
         if len(i.get("instrument_name", "").split("-")) >= 3 and i.get("instrument_name", "").split("-")[-1] in ['C', 'P']
     ]
