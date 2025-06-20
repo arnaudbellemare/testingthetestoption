@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,8 +32,8 @@ TRANSACTION_COST_BPS = 2
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
 
-# Current date and time: 05:14 PM EDT, June 20, 2025 = 21:14 UTC
-CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:14:00", tz="UTC")
+# Current date and time: 05:21 PM EDT, June 20, 2025 = 21:21 UTC
+CURRENT_TIME_UTC = pd.Timestamp("2025-06-20 21:21:00", tz="UTC")
 
 # Initialize exchange
 exchange1 = None
@@ -215,39 +216,50 @@ def get_valid_expiration_options(current_date_utc):
         return []
     expiry_dates = []
     current_date_utc_ts = pd.Timestamp(current_date_utc, tz='UTC')
+    # Regex to validate instrument_name format (e.g., BTC-27JUN25-50000-C)
+    instr_pattern = re.compile(r'^[A-Z]+-\d{2}[A-Z]{3}\d{2}-[0-9.]+-[CP]$')
     for i in instruments:
         instr_name = i.get("instrument_name", "")
-        parts = instr_name.split("-")
-        if len(parts) < 3 or parts[-1] not in ['C', 'P']:
-            logging.debug(f"Skipping invalid instrument format: {instr_name}")
+        if not instr_pattern.match(instr_name):
+            logging.debug(f"Invalid instrument format: {instr_name}")
             continue
+        parts = instr_name.split("-")
         date_str = parts[1]
         try:
-            # Parse date directly as UTC
+            # Parse date as UTC and set time to 08:00
             exp_date = pd.to_datetime(date_str, format="%d%b%y", utc=True, errors='raise')
-            # Ensure time is set to 08:00 UTC
-            exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0, tzinfo=dt.timezone.utc)
+            exp_date = exp_date.replace(hour=8, minute=0, second=0, microsecond=0)
+            # Ensure UTC timezone
             if exp_date.tzinfo is None:
-                logging.error(f"Naive timestamp after replace for {instr_name}: {exp_date}")
                 exp_date = exp_date.tz_localize('UTC')
+            elif exp_date.tzinfo != dt.timezone.utc:
+                exp_date = exp_date.tz_convert('UTC')
             logging.debug(f"Parsed expiry for {instr_name}: {exp_date}, tz: {exp_date.tzinfo}")
             expiry_dates.append(exp_date)
         except (ValueError, TypeError) as e:
             logging.warning(f"Failed to parse date '{date_str}' in instrument {instr_name}: {e}")
             continue
-    # Filter future expiries
-    future_expiries = [
-        exp for exp in expiry_dates
-        if exp.tzinfo == dt.timezone.utc and exp > current_date_utc_ts
-    ]
-    if not future_expiries:
-        logging.warning("No valid future expiry dates found.")
+    # Deduplicate and sort
+    unique_expiries = sorted(list(set(expiry_dates)))
+    if not unique_expiries:
+        logging.warning("No valid expiry dates found.")
         return []
-    # Remove duplicates and sort
-    unique_expiries = sorted(list(set(future_expiries)))
+    # Filter future expiries
+    future_expiries = []
+    for exp in unique_expiries:
+        try:
+            if exp.tzinfo != dt.timezone.utc:
+                exp = exp.tz_convert('UTC')
+            if exp > current_date_utc_ts:
+                future_expiries.append(exp)
+            else:
+                logging.debug(f"Skipping past or equal expiry {exp} vs {current_date_utc_ts}")
+        except TypeError as e:
+            logging.error(f"Timezone comparison error for {exp}: {e}")
+            continue
     logging.info(f"current_date_utc_ts: {current_date_utc_ts}, tz: {current_date_utc_ts.tz}")
-    logging.info(f"Valid expiries: {unique_expiries[:5]}, tz: {[x.tz for x in unique_expiries]}")
-    return unique_expiries
+    logging.info(f"Future expiries: {future_expiries[:5]}, tz: {[x.tz for x in future_expiries]}")
+    return future_expiries
 
 @st.cache_data(ttl=600)
 def get_option_instruments(instruments, option_type, expiry_str, coin):
@@ -595,12 +607,12 @@ def main():
     with st.expander("dft_raw (Initial Fetch - Head)"):
         st.dataframe(dft_raw.head(20))
     with st.expander("dft (After Current Ticker Filter - Head)"):
-        st.dataframe(dft.head(20))
+        st.dataframe(dft.head(10))
     with st.expander("dft_with_hist_greeks (For Sims - Head)"):
-        st.dataframe(dft_with_hist_greeks.head(20))
+        st.dataframe(dft_with_hist_greeks.head(10))
 
+    logging.info(f"--- ADVANCED Dashboard rendering completed for {coin} {e_str} ---")
     gc.collect()
-    logging.info(f"--- ADVANCED Dashboard rendering complete for {coin} {e_str} ---")
 
 if __name__ == "__main__":
     main()
